@@ -34,7 +34,9 @@ export function Composer({
   }, [value])
 
   useEffect(() => {
-    if (!streaming && !disabled) ref.current?.focus()
+    // Autofocus only where there is a real pointer; on touch it forces the keyboard open.
+    const finePointer = window.matchMedia('(hover: hover) and (pointer: fine)').matches
+    if (finePointer && !streaming && !disabled) ref.current?.focus()
   }, [streaming, disabled])
 
   function handleKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {

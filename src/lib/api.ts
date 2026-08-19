@@ -1,4 +1,5 @@
 import type { ApiConfig, Message, ModelInfo, Provider, Usage } from '../types'
+import { createThinkingSplitter, splitThinking, type ThinkChunk } from './thinking'
 
 /** Human-readable failure that already carries a Persian, user-facing message. */
 export class ApiError extends Error {
@@ -139,42 +140,145 @@ export async function listModels(config: ApiConfig, signal?: AbortSignal): Promi
 /*                                    Chat                                     */
 /* -------------------------------------------------------------------------- */
 
+/** A tool exposed to the model, described once and mapped to both protocols. */
+export interface ToolSpec {
+  name: string
+  description: string
+  /** JSON Schema for the arguments object. */
+  parameters: Record<string, unknown>
+}
+
+/** A tool invocation the model asked for; `arguments` is a raw JSON string. */
+export interface ToolCall {
+  id: string
+  name: string
+  arguments: string
+}
+
+/**
+ * A turn as it goes on the wire. The harness builds these from `Message`s so
+ * tool traffic can be replayed to the model without polluting the UI history.
+ */
+export type WireMessage =
+  | { role: 'user'; content: string }
+  | { role: 'assistant'; content: string; toolCalls?: ToolCall[] }
+  | { role: 'tool'; toolCallId: string; name: string; content: string }
+
 export interface ChatRequest {
   config: ApiConfig
   model: string
-  messages: Message[]
+  messages: WireMessage[]
   systemPrompt: string
   temperature: number
   maxTokens: number
   stream: boolean
   signal: AbortSignal
-  onDelta: (chunk: { text?: string; reasoning?: string }) => void
+  onDelta: (chunk: ThinkChunk) => void
+  /** When present and non-empty, the model may answer with tool calls. */
+  tools?: ToolSpec[]
 }
 
 export interface ChatResult {
   usage?: Usage
+  /** Tool calls the model requested instead of — or alongside — a final answer. */
+  toolCalls: ToolCall[]
 }
 
-function toWireMessages(messages: Message[]) {
+/** Strips inline `<think>` blocks; the model only needs the answer back. */
+export function toWireMessages(messages: Message[]): WireMessage[] {
   return messages
-    .filter((m) => m.role !== 'system' && !m.error && m.content.trim() !== '')
-    .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }))
+    .filter((m) => m.role !== 'system' && !m.error)
+    .map((m) => ({
+      role: m.role as 'user' | 'assistant',
+      content: splitThinking(m.content).text,
+    }))
+    .filter((m) => m.content.trim() !== '')
+}
+
+function parseArgs(raw: string): Record<string, unknown> {
+  try {
+    const value = JSON.parse(raw || '{}')
+    return value && typeof value === 'object' ? (value as Record<string, unknown>) : {}
+  } catch {
+    return {}
+  }
+}
+
+function openAiMessages(messages: WireMessage[]) {
+  return messages.map((m) => {
+    if (m.role === 'tool') {
+      return { role: 'tool' as const, tool_call_id: m.toolCallId, content: m.content }
+    }
+    if (m.role === 'assistant' && m.toolCalls?.length) {
+      return {
+        role: 'assistant' as const,
+        content: m.content || null,
+        tool_calls: m.toolCalls.map((t) => ({
+          id: t.id,
+          type: 'function' as const,
+          function: { name: t.name, arguments: t.arguments || '{}' },
+        })),
+      }
+    }
+    return { role: m.role, content: m.content }
+  })
+}
+
+/**
+ * Anthropic carries tool results as `user` turns, so consecutive tool replies
+ * are merged into one message — the API rejects a turn per result.
+ */
+function anthropicMessages(messages: WireMessage[]) {
+  const out: Array<{ role: 'user' | 'assistant'; content: any }> = []
+
+  for (const m of messages) {
+    if (m.role === 'tool') {
+      const block = { type: 'tool_result', tool_use_id: m.toolCallId, content: m.content }
+      const last = out[out.length - 1]
+      if (last?.role === 'user' && Array.isArray(last.content)) last.content.push(block)
+      else out.push({ role: 'user', content: [block] })
+      continue
+    }
+    if (m.role === 'assistant' && m.toolCalls?.length) {
+      const content: any[] = []
+      if (m.content.trim()) content.push({ type: 'text', text: m.content })
+      for (const t of m.toolCalls) {
+        content.push({ type: 'tool_use', id: t.id, name: t.name, input: parseArgs(t.arguments) })
+      }
+      out.push({ role: 'assistant', content })
+      continue
+    }
+    out.push({ role: m.role, content: m.content })
+  }
+
+  return out
 }
 
 function buildBody(req: ChatRequest, provider: Provider) {
-  const messages = toWireMessages(req.messages)
   const system = req.systemPrompt.trim()
+  const tools = req.tools?.length ? req.tools : undefined
 
   if (provider === 'anthropic') {
     return {
       model: req.model,
-      messages,
+      messages: anthropicMessages(req.messages),
       ...(system ? { system } : {}),
       max_tokens: req.maxTokens,
       temperature: req.temperature,
       stream: req.stream,
+      ...(tools
+        ? {
+            tools: tools.map((t) => ({
+              name: t.name,
+              description: t.description,
+              input_schema: t.parameters,
+            })),
+          }
+        : {}),
     }
   }
+
+  const messages = openAiMessages(req.messages)
   return {
     model: req.model,
     messages: system ? [{ role: 'system', content: system }, ...messages] : messages,
@@ -182,6 +286,15 @@ function buildBody(req: ChatRequest, provider: Provider) {
     temperature: req.temperature,
     stream: req.stream,
     ...(req.stream ? { stream_options: { include_usage: true } } : {}),
+    ...(tools
+      ? {
+          tools: tools.map((t) => ({
+            type: 'function',
+            function: { name: t.name, description: t.description, parameters: t.parameters },
+          })),
+          tool_choice: 'auto',
+        }
+      : {}),
   }
 }
 
@@ -232,6 +345,30 @@ function readUsage(u: any, provider: Provider): Usage | undefined {
   return input || output ? { input, output } : undefined
 }
 
+/** Collects streamed tool-call fragments, which arrive keyed by block index. */
+function toolCallCollector() {
+  const parts = new Map<number, ToolCall>()
+
+  return {
+    open(index: number, id: string, name: string) {
+      parts.set(index, { id: id || `call_${index}`, name, arguments: '' })
+    },
+    push(index: number, id?: string, name?: string, args?: string) {
+      const current = parts.get(index) ?? { id: id || `call_${index}`, name: name ?? '', arguments: '' }
+      if (id) current.id = id
+      if (name) current.name = name
+      if (args) current.arguments += args
+      parts.set(index, current)
+    },
+    result(): ToolCall[] {
+      return [...parts.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([, v]) => v)
+        .filter((v) => v.name)
+    },
+  }
+}
+
 export async function sendChat(req: ChatRequest): Promise<ChatResult> {
   const { config, signal } = req
   const base = normalizeBaseUrl(config.baseUrl)
@@ -251,6 +388,16 @@ export async function sendChat(req: ChatRequest): Promise<ChatResult> {
   }
   if (!res.ok) throw await toApiError(res)
 
+  // Reasoning models that inline their chain of thought in the answer text get
+  // it peeled back off here, so `reasoning` is populated either way.
+  const splitter = createThinkingSplitter()
+  const emitText = (t: string) => {
+    for (const chunk of splitter.push(t)) req.onDelta(chunk)
+  }
+  const finishText = () => {
+    for (const chunk of splitter.flush()) req.onDelta(chunk)
+  }
+
   /* ----------------------------- non-streaming ---------------------------- */
   if (!req.stream) {
     const json = await res.json().catch(() => null)
@@ -264,19 +411,36 @@ export async function sendChat(req: ChatRequest): Promise<ChatResult> {
         .filter((b) => b?.type === 'text')
         .map((b) => b.text)
         .join('')
+      const toolCalls: ToolCall[] = blocks
+        .filter((b) => b?.type === 'tool_use')
+        .map((b) => ({
+          id: String(b.id),
+          name: String(b.name),
+          arguments: JSON.stringify(b.input ?? {}),
+        }))
       if (reasoning) req.onDelta({ reasoning })
-      req.onDelta({ text })
-      return { usage: readUsage(json?.usage, provider) }
+      emitText(text)
+      finishText()
+      return { usage: readUsage(json?.usage, provider), toolCalls }
     }
+
     const choice = json?.choices?.[0]?.message
     const reasoning = choice?.reasoning_content ?? choice?.reasoning
     if (reasoning) req.onDelta({ reasoning: String(reasoning) })
-    req.onDelta({ text: String(choice?.content ?? '') })
-    return { usage: readUsage(json?.usage, provider) }
+    emitText(String(choice?.content ?? ''))
+    finishText()
+    const toolCalls: ToolCall[] = (choice?.tool_calls ?? []).map((t: any, i: number) => ({
+      id: String(t?.id ?? `call_${i}`),
+      name: String(t?.function?.name ?? ''),
+      arguments: String(t?.function?.arguments ?? '{}'),
+    }))
+    return { usage: readUsage(json?.usage, provider), toolCalls: toolCalls.filter((t) => t.name) }
   }
 
   /* -------------------------------- streaming ------------------------------ */
   let usage: Usage | undefined
+  const calls = toolCallCollector()
+
   for await (const data of sseEvents(res, signal)) {
     if (data === '[DONE]') break
     let event: any
@@ -292,10 +456,20 @@ export async function sendChat(req: ChatRequest): Promise<ChatResult> {
 
     if (provider === 'anthropic') {
       switch (event.type) {
+        case 'content_block_start': {
+          const block = event.content_block
+          if (block?.type === 'tool_use') {
+            calls.open(event.index ?? 0, String(block.id ?? ''), String(block.name ?? ''))
+          }
+          break
+        }
         case 'content_block_delta': {
           const d = event.delta
-          if (d?.type === 'text_delta' && d.text) req.onDelta({ text: d.text })
+          if (d?.type === 'text_delta' && d.text) emitText(d.text)
           else if (d?.type === 'thinking_delta' && d.thinking) req.onDelta({ reasoning: d.thinking })
+          else if (d?.type === 'input_json_delta') {
+            calls.push(event.index ?? 0, undefined, undefined, String(d.partial_json ?? ''))
+          }
           break
         }
         case 'message_start':
@@ -313,12 +487,46 @@ export async function sendChat(req: ChatRequest): Promise<ChatResult> {
     }
 
     const delta = event?.choices?.[0]?.delta
-    if (delta?.content) req.onDelta({ text: String(delta.content) })
+    if (delta?.content) emitText(String(delta.content))
     const reasoning = delta?.reasoning_content ?? delta?.reasoning
     if (reasoning) req.onDelta({ reasoning: String(reasoning) })
+    for (const t of delta?.tool_calls ?? []) {
+      calls.push(t?.index ?? 0, t?.id, t?.function?.name, t?.function?.arguments)
+    }
     const u = readUsage(event?.usage, provider)
     if (u) usage = u
   }
 
-  return { usage }
+  finishText()
+  return { usage, toolCalls: calls.result() }
+}
+
+/**
+ * One-shot completion — no streaming, no tools. The harness uses it for its own
+ * background work: titles, rolling summaries and memory extraction.
+ */
+export async function complete(
+  config: ApiConfig,
+  model: string,
+  systemPrompt: string,
+  prompt: string,
+  options: { maxTokens?: number; temperature?: number; signal?: AbortSignal } = {},
+): Promise<string> {
+  let text = ''
+
+  await sendChat({
+    config,
+    model,
+    messages: [{ role: 'user', content: prompt }],
+    systemPrompt,
+    temperature: options.temperature ?? 0,
+    maxTokens: options.maxTokens ?? 700,
+    stream: false,
+    signal: options.signal ?? new AbortController().signal,
+    onDelta: ({ text: t }) => {
+      if (t) text += t
+    },
+  })
+
+  return text.trim()
 }
