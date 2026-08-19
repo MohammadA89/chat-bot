@@ -102,6 +102,88 @@ export function SettingsModal({
 
           <div className="switch-row">
             <div>
+              <div className="field-label">ابزارهای عامل</div>
+              <p className="field-hint">اجازه می‌دهد مدل از Workspace، Git، GitHub و حافظه‌ی پروژه استفاده کند.</p>
+            </div>
+            <button
+              className={`switch${draft.toolsEnabled ? ' on' : ''}`}
+              onClick={() => set('toolsEnabled', !draft.toolsEnabled)}
+              role="switch"
+              aria-checked={draft.toolsEnabled}
+              aria-label="ابزارهای عامل"
+            />
+          </div>
+
+          <div className="field">
+            <div className="field-label">اختیار دستیار در Workspace</div>
+            <p className="field-hint">
+              تعیین می‌کند مدل تا کجا می‌تواند فایل‌های واقعی، ترمینال و GitHub شما را تغییر دهد.
+            </p>
+            <div className="ws-modes">
+              {([
+                { id: 'plan', label: 'فقط مطالعه', hint: 'می‌خواند و پیشنهاد می‌دهد؛ چیزی تغییر نمی‌کند.' },
+                { id: 'ask', label: 'با تأیید من', hint: 'قبل از هر تغییر diff یا دستور را می‌بینید.' },
+                { id: 'auto', label: 'خودگردان', hint: 'بدون پرسش اعمال می‌کند.' },
+              ] as const).map((mode) => (
+                <button
+                  type="button"
+                  key={mode.id}
+                  className={`ws-mode${draft.approvalMode === mode.id ? ' active' : ''}`}
+                  onClick={() => set('approvalMode', mode.id)}
+                >
+                  <strong>{mode.label}</strong>
+                  <span>{mode.hint}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="switch-row">
+            <div>
+              <div className="field-label">حافظه‌ی خودکار پروژه</div>
+              <p className="field-hint">تصمیم‌ها و محدودیت‌های پایدار را بعد از پاسخ در پروژه نگه می‌دارد.</p>
+            </div>
+            <button
+              className={`switch${draft.autoMemory ? ' on' : ''}`}
+              onClick={() => set('autoMemory', !draft.autoMemory)}
+              role="switch"
+              aria-checked={draft.autoMemory}
+              aria-label="حافظه‌ی خودکار پروژه"
+              disabled={!draft.toolsEnabled}
+            />
+          </div>
+
+          <div className="switch-row">
+            <div>
+              <div className="field-label">خلاصه‌سازی خودکار زمینه</div>
+              <p className="field-hint">در گفتگوهای طولانی، تصمیم‌های قدیمی را به خلاصه‌ی فشرده تبدیل می‌کند.</p>
+            </div>
+            <button
+              className={`switch${draft.autoSummarize ? ' on' : ''}`}
+              onClick={() => set('autoSummarize', !draft.autoSummarize)}
+              role="switch"
+              aria-checked={draft.autoSummarize}
+              aria-label="خلاصه‌سازی خودکار زمینه"
+            />
+          </div>
+
+          <div className="field">
+            <label className="field-label">بودجه‌ی زمینه — {toFa(draft.contextBudget.toLocaleString())} توکن</label>
+            <div className="slider-row">
+              <input
+                type="range"
+                min={4000}
+                max={64000}
+                step={1000}
+                value={draft.contextBudget}
+                onChange={(e) => set('contextBudget', Number(e.target.value))}
+              />
+              <output>{draft.contextBudget}</output>
+            </div>
+          </div>
+
+          <div className="switch-row">
+            <div>
               <div className="field-label">ارسال با کلید Enter</div>
               <p className="field-hint">در حالت غیرفعال، ارسال با Ctrl + Enter انجام می‌شود.</p>
             </div>

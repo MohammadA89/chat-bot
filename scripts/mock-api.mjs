@@ -35,6 +35,19 @@ def greet(name: str) -> str:
 و یک رابطه‌ی ریاضی: $e^{i\\pi} + 1 = 0$
 `
 
+/**
+ * A DeepSeek-R1 style reply: the chain of thought is inlined in the answer
+ * text inside <think> tags rather than sent in a separate field.
+ */
+const THINKING = `<think>
+خب، کاربر سلام کرده است. پاسخ باید کوتاه و ساختارمند باشد.
+اول نکته‌های کلیدی را فهرست می‌کنم، بعد یک مثال کد می‌آورم.
+</think>
+
+`
+
+const replyFor = (model) => (model === 'mock-reasoning' ? THINKING + REPLY : REPLY)
+
 function cors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*')
   res.setHeader('Access-Control-Allow-Headers', '*')
@@ -84,6 +97,27 @@ function streamFrames(res, frames) {
 const sse = (data) => `data: ${JSON.stringify(data)}\n\n`
 const chunks = (text) => text.match(/[\s\S]{1,24}/g) ?? []
 
+/**
+ * The mock plays along with the harness: the first request that carries tools
+ * answers with a tool call, and once the result comes back it writes the reply.
+ * That exercises the whole loop without a real provider.
+ */
+function wantsToolCall(body) {
+  if (!body.tools?.length) return false
+  const already = (body.messages ?? []).some(
+    (m) =>
+      m.role === 'tool' ||
+      (Array.isArray(m.content) && m.content.some((b) => b?.type === 'tool_result')),
+  )
+  if (already) return false
+  const names = body.tools.map((t) => t.function?.name ?? t.name)
+  return names.includes('remember')
+}
+
+const TOOL_ARGS = JSON.stringify({
+  facts: ['کاربر رابط فارسی و راست‌به‌چپ می‌خواهد.', 'پروژه با React و Vite ساخته می‌شود.'],
+})
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`)
   const path = url.pathname.replace(/^\/v1/, '')
@@ -107,15 +141,40 @@ const server = createServer(async (req, res) => {
   if (path === '/chat/completions' && req.method === 'POST') {
     const body = await readBody(req)
     const model = body.model ?? 'mock-pro'
+    const reply = replyFor(model)
+
+    if (wantsToolCall(body)) {
+      const call = { id: 'call_mock_1', type: 'function', function: { name: 'remember', arguments: TOOL_ARGS } }
+      if (!body.stream) {
+        return json(res, 200, {
+          id: 'cmpl-mock',
+          model,
+          choices: [
+            { index: 0, message: { role: 'assistant', content: null, tool_calls: [call] }, finish_reason: 'tool_calls' },
+          ],
+          usage: { prompt_tokens: 40, completion_tokens: 20, total_tokens: 60 },
+        })
+      }
+      const toolFrames = [
+        sse({ id: 'cmpl-mock', model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: call.id, type: 'function', function: { name: 'remember', arguments: '' } }] } }] }),
+        ...chunks(TOOL_ARGS).map((piece) =>
+          sse({ id: 'cmpl-mock', model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: piece } }] } }] }),
+        ),
+        sse({ id: 'cmpl-mock', model, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }),
+        'data: [DONE]\n\n',
+      ]
+      return streamFrames(res, toolFrames)
+    }
+
     if (!body.stream) {
       return json(res, 200, {
         id: 'cmpl-mock',
         model,
-        choices: [{ index: 0, message: { role: 'assistant', content: REPLY }, finish_reason: 'stop' }],
+        choices: [{ index: 0, message: { role: 'assistant', content: reply }, finish_reason: 'stop' }],
         usage: { prompt_tokens: 42, completion_tokens: 180, total_tokens: 222 },
       })
     }
-    const frames = chunks(REPLY).map((c) =>
+    const frames = chunks(reply).map((c) =>
       sse({ id: 'cmpl-mock', model, choices: [{ index: 0, delta: { content: c } }] }),
     )
     frames.push(sse({ id: 'cmpl-mock', model, choices: [], usage: { prompt_tokens: 42, completion_tokens: 180 } }))
@@ -126,18 +185,44 @@ const server = createServer(async (req, res) => {
   if (path === '/messages' && req.method === 'POST') {
     const body = await readBody(req)
     const model = body.model ?? 'mock-pro'
+    const reply = replyFor(model)
+
+    if (wantsToolCall(body)) {
+      const input = JSON.parse(TOOL_ARGS)
+      if (!body.stream) {
+        return json(res, 200, {
+          id: 'msg-mock',
+          model,
+          stop_reason: 'tool_use',
+          content: [{ type: 'tool_use', id: 'toolu_mock_1', name: 'remember', input }],
+          usage: { input_tokens: 40, output_tokens: 20 },
+        })
+      }
+      const toolFrames = [
+        sse({ type: 'message_start', message: { id: 'msg-mock', model, usage: { input_tokens: 40, output_tokens: 0 } } }),
+        sse({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_mock_1', name: 'remember', input: {} } }),
+        ...chunks(TOOL_ARGS).map((piece) =>
+          sse({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: piece } }),
+        ),
+        sse({ type: 'content_block_stop', index: 0 }),
+        sse({ type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 20 } }),
+        sse({ type: 'message_stop' }),
+      ]
+      return streamFrames(res, toolFrames)
+    }
+
     if (!body.stream) {
       return json(res, 200, {
         id: 'msg-mock',
         model,
-        content: [{ type: 'text', text: REPLY }],
+        content: [{ type: 'text', text: reply }],
         usage: { input_tokens: 42, output_tokens: 180 },
       })
     }
     const frames = [
       sse({ type: 'message_start', message: { id: 'msg-mock', model, usage: { input_tokens: 42, output_tokens: 0 } } }),
       sse({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }),
-      ...chunks(REPLY).map((c) =>
+      ...chunks(reply).map((c) =>
         sse({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: c } }),
       ),
       sse({ type: 'content_block_stop', index: 0 }),

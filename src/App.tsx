@@ -1,139 +1,242 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ApiConfig, Conversation, Message, ModelInfo, Settings } from './types'
-import { ApiError, listModels, sendChat } from './lib/api'
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import type {
+  ApiConfig,
+  ApprovalRequest,
+  BridgeConfig,
+  BridgeEvent,
+  BridgeStatus,
+  Conversation,
+  Message,
+  ModelInfo,
+  Project,
+  Settings,
+} from './types'
+import { ApiError, listModels } from './lib/api'
+import { callBridge, probeBridge, subscribeBridgeEvents } from './lib/bridge'
+import { extractFacts, runTurn } from './lib/harness'
 import { storage } from './lib/storage'
-import { createConversation, createMessage, deriveTitle, uid } from './lib/utils'
+import { addFacts } from './lib/tools'
+import { createConversation, createMessage, deriveTitle, toFa, uid } from './lib/utils'
 import { Setup } from './components/Setup'
 import { Sidebar } from './components/Sidebar'
 import { ModelPicker } from './components/ModelPicker'
 import { ChatMessage } from './components/ChatMessage'
 import { Composer } from './components/Composer'
 import { SettingsModal } from './components/SettingsModal'
+import { ProjectModal } from './components/ProjectModal'
+import { WorkspaceModal } from './components/WorkspaceModal'
+import { WorkspacePanel } from './components/WorkspacePanel'
+import { ApprovalDialog } from './components/ApprovalDialog'
+import { ResizeHandle } from './components/ResizeHandle'
 import { Welcome } from './components/Welcome'
 import { useToasts } from './hooks/useToasts'
-import { IconArrowDown, IconPlus, IconSidebar } from './components/Icons'
+import { isMobileViewport, useIsMobile } from './hooks/useMediaQuery'
+import {
+  IconArrowDown,
+  IconCode,
+  IconFolder,
+  IconGitBranch,
+  IconPanel,
+  IconPlus,
+  IconSidebar,
+} from './components/Icons'
 
 export default function App() {
   const [config, setConfig] = useState<ApiConfig | null>(() => storage.loadConfig())
+  const [bridgeConfig, setBridgeConfig] = useState<BridgeConfig | null>(() => storage.loadBridgeConfig())
+  const [bridgeStatus, setBridgeStatus] = useState<BridgeStatus | null>(null)
   const [models, setModels] = useState<ModelInfo[]>([])
   const [modelsLoading, setModelsLoading] = useState(false)
   const [conversations, setConversations] = useState<Conversation[]>(() => storage.loadConversations())
+  const [projects, setProjects] = useState<Project[]>(() => storage.loadProjects())
   const [activeId, setActiveId] = useState<string | null>(() => storage.loadActiveId())
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(() => storage.loadActiveProjectId())
   const [settings, setSettings] = useState<Settings>(() => storage.loadSettings())
   const [model, setModel] = useState('')
   const [input, setInput] = useState('')
   const [streaming, setStreaming] = useState(false)
-  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [sidebarOpen, setSidebarOpen] = useState(() => !isMobileViewport())
   const [showSettings, setShowSettings] = useState(false)
+  const [showWorkspace, setShowWorkspace] = useState(false)
+  /** `null` closed, `{ id: null }` creating, `{ id }` editing that project. */
+  const [projectEditor, setProjectEditor] = useState<{ id: string | null } | null>(null)
   const [reconnecting, setReconnecting] = useState(false)
   const [atBottom, setAtBottom] = useState(true)
+  /** Last event pushed by the sidecar; the workspace panel reacts to it. */
+  const [bridgeEvent, setBridgeEvent] = useState<BridgeEvent | null>(null)
+  const [approval, setApproval] = useState<ApprovalRequest | null>(null)
+  const [layout, setLayout] = useState(() => storage.loadLayout())
 
+  const mobile = useIsMobile()
   const abortRef = useRef<AbortController | null>(null)
+  /** Resolver for the approval dialog currently on screen. */
+  const approvalRef = useRef<((allowed: boolean) => void) | null>(null)
+  /** Tools the user approved for the rest of the session, per «همیشه». */
+  const trustedTools = useRef<Set<string>>(new Set())
   const scrollRef = useRef<HTMLDivElement>(null)
   const { push: toast, view: toastView } = useToasts()
-
   const active = useMemo(
-    () => conversations.find((c) => c.id === activeId) ?? null,
+    () => conversations.find((conversation) => conversation.id === activeId) ?? null,
     [conversations, activeId],
   )
-
-  /* ------------------------------ persistence ----------------------------- */
-
-  useEffect(() => {
-    const t = setTimeout(() => storage.saveConversations(conversations), 400)
-    return () => clearTimeout(t)
-  }, [conversations])
-
-  useEffect(() => storage.saveActiveId(activeId), [activeId])
-  useEffect(() => storage.saveSettings(settings), [settings])
-
-  useEffect(() => {
-    document.documentElement.setAttribute('data-theme', settings.theme)
-  }, [settings.theme])
-
-  /* -------------------------------- models -------------------------------- */
-
-  const refreshModels = useCallback(
-    async (cfg: ApiConfig, quiet = false) => {
-      setModelsLoading(true)
-      try {
-        const list = await listModels(cfg)
-        setModels(list)
-        setModel((current) => (current && list.some((m) => m.id === current) ? current : list[0]?.id ?? ''))
-        if (!quiet) toast(`${list.length} مدل بارگیری شد`, 'success')
-      } catch (err) {
-        toast(err instanceof ApiError ? 'بارگیری مدل‌ها ناموفق بود' : 'خطا در دریافت مدل‌ها', 'error')
-      } finally {
-        setModelsLoading(false)
-      }
-    },
-    [toast],
+  const activeProject = useMemo(
+    () => projects.find((project) => project.id === (active?.projectId ?? activeProjectId)) ?? null,
+    [projects, active?.projectId, activeProjectId],
   )
 
-  // Load the catalogue once for a session restored from storage.
+  useEffect(() => {
+    const timer = setTimeout(() => storage.saveConversations(conversations), 300)
+    return () => clearTimeout(timer)
+  }, [conversations])
+  useEffect(() => {
+    const timer = setTimeout(() => storage.saveProjects(projects), 300)
+    return () => clearTimeout(timer)
+  }, [projects])
+  useEffect(() => storage.saveActiveId(activeId), [activeId])
+  useEffect(() => storage.saveActiveProjectId(activeProjectId), [activeProjectId])
+  useEffect(() => storage.saveLayout(layout), [layout])
+  useEffect(() => storage.saveSettings(settings), [settings])
+  useEffect(() => document.documentElement.setAttribute('data-theme', settings.theme), [settings.theme])
+
+  // The drawer is closed by default on phones and restored on wider screens.
+  useEffect(() => setSidebarOpen(!mobile), [mobile])
+
+  useEffect(() => {
+    if (!bridgeConfig) {
+      setBridgeStatus(null)
+      return
+    }
+    const controller = new AbortController()
+    void probeBridge(bridgeConfig, controller.signal).then(setBridgeStatus).catch(() => setBridgeStatus(null))
+    return () => controller.abort()
+  }, [bridgeConfig])
+
+  // Live file-change and terminal events from the sidecar, reconnected on drop.
+  useEffect(() => {
+    if (!bridgeConfig || !bridgeStatus) return
+    let stopped = false
+    let unsubscribe = () => {}
+    let retry: number | undefined
+
+    const connect = () => {
+      if (stopped) return
+      unsubscribe = subscribeBridgeEvents(bridgeConfig, setBridgeEvent, () => {
+        retry = window.setTimeout(connect, 4000)
+      })
+    }
+    connect()
+
+    return () => {
+      stopped = true
+      window.clearTimeout(retry)
+      unsubscribe()
+    }
+  }, [bridgeConfig, bridgeStatus?.workspace.root]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  /**
+   * Shows the permission dialog and resolves once the user decides. `always`
+   * whitelists the tool for the rest of the session.
+   */
+  const requestApproval = useCallback((request: Omit<ApprovalRequest, 'id'>): Promise<boolean> => {
+    if (trustedTools.current.has(request.tool)) return Promise.resolve(true)
+    return new Promise<boolean>((resolve) => {
+      approvalRef.current = resolve
+      setApproval({ ...request, id: uid() })
+    })
+  }, [])
+
+  const decideApproval = useCallback((decision: 'allow' | 'always' | 'deny') => {
+    if (decision === 'always' && approval) trustedTools.current.add(approval.tool)
+    approvalRef.current?.(decision !== 'deny')
+    approvalRef.current = null
+    setApproval(null)
+  }, [approval])
+
+  const refreshModels = useCallback(async (nextConfig: ApiConfig, quiet = false) => {
+    setModelsLoading(true)
+    try {
+      const list = await listModels(nextConfig)
+      setModels(list)
+      setModel((current) => current && list.some((item) => item.id === current) ? current : list[0]?.id ?? '')
+      if (!quiet) toast(`${list.length} مدل بارگیری شد`, 'success')
+    } catch (error) {
+      toast(error instanceof ApiError ? 'بارگیری مدل‌ها ناموفق بود' : 'خطا در دریافت مدل‌ها', 'error')
+    } finally {
+      setModelsLoading(false)
+    }
+  }, [toast])
+
   useEffect(() => {
     if (config && models.length === 0) void refreshModels(config, true)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [config])
-
-  // Keep the active conversation's model in sync with the picker.
+  }, [config, models.length, refreshModels])
   useEffect(() => {
     if (active && model && active.model !== model) {
-      setConversations((list) =>
-        list.map((c) => (c.id === active.id ? { ...c, model } : c)),
-      )
+      setConversations((list) => list.map((item) => item.id === active.id ? { ...item, model } : item))
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [model])
-
+  }, [active, model])
   useEffect(() => {
-    if (active?.model && models.some((m) => m.id === active.model)) setModel(active.model)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeId])
-
-  /* ------------------------------- scrolling ------------------------------ */
+    if (active?.model && models.some((item) => item.id === active.model)) setModel(active.model)
+  }, [activeId, active?.model, models])
 
   const scrollToBottom = useCallback((smooth = true) => {
-    const el = scrollRef.current
-    if (!el) return
-    el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' })
+    const element = scrollRef.current
+    if (element) element.scrollTo({ top: element.scrollHeight, behavior: smooth ? 'smooth' : 'auto' })
   }, [])
-
   function handleScroll() {
-    const el = scrollRef.current
-    if (!el) return
-    setAtBottom(el.scrollHeight - el.scrollTop - el.clientHeight < 90)
+    const element = scrollRef.current
+    if (element) setAtBottom(element.scrollHeight - element.scrollTop - element.clientHeight < 90)
   }
-
   useEffect(() => {
     if (atBottom) scrollToBottom(false)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active?.messages.length, activeId])
+  }, [active?.messages.length, activeId, atBottom, scrollToBottom])
 
-  /* -------------------------- conversation helpers ------------------------ */
-
-  const patchConversation = useCallback((id: string, patch: (c: Conversation) => Conversation) => {
-    setConversations((list) => list.map((c) => (c.id === id ? patch(c) : c)))
+  const patchConversation = useCallback((id: string, patch: (value: Conversation) => Conversation) => {
+    setConversations((list) => list.map((item) => item.id === id ? patch(item) : item))
   }, [])
-
   const newChat = useCallback(() => {
-    const c = createConversation(model)
-    setConversations((list) => [c, ...list])
-    setActiveId(c.id)
+    const conversation = { ...createConversation(model), projectId: activeProjectId }
+    setConversations((list) => [conversation, ...list])
+    setActiveId(conversation.id)
     setInput('')
-    if (window.innerWidth <= 860) setSidebarOpen(false)
-  }, [model])
+    if (isMobileViewport()) setSidebarOpen(false)
+  }, [activeProjectId, model])
 
+  function saveProject(next: Project) {
+    const isNew = !projects.some((project) => project.id === next.id)
+    setProjects((list) => isNew ? [next, ...list] : list.map((project) => project.id === next.id ? next : project))
+    setProjectEditor(null)
+    if (!isNew) return toast('پروژه به‌روزرسانی شد', 'success')
+
+    // A fresh project opens straight into its first chat.
+    const conversation = { ...createConversation(model), projectId: next.id }
+    setConversations((list) => [conversation, ...list])
+    setActiveProjectId(next.id)
+    setActiveId(conversation.id)
+    toast(`پروژه‌ی «${next.name}» ساخته شد`, 'success')
+  }
+  function deleteProject(id: string) {
+    setProjects((list) => list.filter((project) => project.id !== id))
+    // Chats survive their project; they simply become loose chats.
+    setConversations((list) => list.map((item) => item.projectId === id ? { ...item, projectId: null } : item))
+    if (activeProjectId === id) setActiveProjectId(null)
+    setProjectEditor(null)
+    toast('پروژه حذف شد', 'success')
+  }
+  function openProject(id: string) {
+    setActiveProjectId(id)
+    const recent = conversations.filter((item) => item.projectId === id).sort((a, b) => b.updatedAt - a.updatedAt)[0]
+    if (recent) setActiveId(recent.id)
+    else {
+      const conversation = { ...createConversation(model), projectId: id }
+      setConversations((list) => [conversation, ...list])
+      setActiveId(conversation.id)
+    }
+  }
   function deleteConversation(id: string) {
-    setConversations((list) => list.filter((c) => c.id !== id))
+    setConversations((list) => list.filter((item) => item.id !== id))
     if (activeId === id) setActiveId(null)
     toast('گفتگو حذف شد', 'success')
   }
-
-  function renameConversation(id: string, title: string) {
-    patchConversation(id, (c) => ({ ...c, title }))
-  }
-
   function clearHistory() {
     setConversations([])
     setActiveId(null)
@@ -141,297 +244,314 @@ export default function App() {
     toast('همه‌ی گفتگوها حذف شد', 'success')
   }
 
-  /* --------------------------------- send --------------------------------- */
+  const runCompletion = useCallback(async (conversationId: string, history: Message[]) => {
+    if (!config || !model) return
+    const snapshot = conversations.find((item) => item.id === conversationId)
+    if (!snapshot) return
+    const placeholder = createMessage('assistant', '', { model, toolRuns: [] })
+    patchConversation(conversationId, (conversation) => ({
+      ...conversation, messages: [...conversation.messages, placeholder], updatedAt: Date.now(),
+    }))
 
-  /**
-   * Runs one completion against `history` and appends the answer to `convId`.
-   * Streaming deltas are buffered and flushed on animation frames so a fast
-   * token stream doesn't trigger a React render per token.
-   */
-  const runCompletion = useCallback(
-    async (convId: string, history: Message[]) => {
-      if (!config || !model) return
+    const controller = new AbortController()
+    abortRef.current = controller
+    setStreaming(true)
+    let answer = ''
+    let reasoning = ''
+    let frame = 0
+    let projectDraft = projects.find((project) => project.id === snapshot.projectId) ?? null
 
-      const placeholder = createMessage('assistant', '', { model })
-      patchConversation(convId, (c) => ({
-        ...c,
-        messages: [...c.messages, placeholder],
+    const flush = () => {
+      frame = 0
+      patchConversation(conversationId, (conversation) => ({
+        ...conversation,
+        messages: conversation.messages.map((message) => message.id === placeholder.id
+          ? { ...message, content: answer, reasoning: reasoning || undefined }
+          : message),
+      }))
+    }
+    const schedule = () => { if (frame === 0) frame = requestAnimationFrame(flush) }
+
+    try {
+      const result = await runTurn({
+        config,
+        model,
+        settings,
+        conversation: { ...snapshot, messages: history },
+        project: projectDraft,
+        history,
+        signal: controller.signal,
+        env: {
+          getProject: () => projectDraft,
+          setProject: (next) => {
+            projectDraft = next
+            setProjects((list) => list.map((project) => project.id === next.id ? next : project))
+          },
+          renameConversation: (title) => patchConversation(conversationId, (item) => ({ ...item, title })),
+          searchChats: (query) => {
+            const normalized = query.toLocaleLowerCase()
+            return conversations.filter((conversation) =>
+              conversation.title.toLocaleLowerCase().includes(normalized) ||
+              conversation.messages.some((message) => message.content.toLocaleLowerCase().includes(normalized)),
+            ).slice(0, 8).map((conversation) => ({
+              title: conversation.title,
+              snippet: conversation.messages.find((message) => message.content.toLocaleLowerCase().includes(normalized))?.content.slice(0, 180) ?? '',
+              updatedAt: conversation.updatedAt,
+            }))
+          },
+          ...(bridgeConfig && bridgeStatus ? {
+            bridge: {
+              status: bridgeStatus,
+              mode: settings.approvalMode,
+              approve: requestApproval,
+              call: <T,>(method: string, params: Record<string, unknown> = {}) =>
+                callBridge<T>(bridgeConfig, method, params, controller.signal),
+              onWorkspaceChange: (path?: string) =>
+                setBridgeEvent({ type: 'fs.change', payload: { path: path ?? '.' }, at: Date.now() }),
+            },
+          } : {}),
+        },
+        onDelta: ({ text, reasoning: thought, reclassifyAsReasoning }) => {
+          if (text) answer += text
+          if (thought) reasoning += thought
+          if (reclassifyAsReasoning) { reasoning += answer; answer = '' }
+          schedule()
+        },
+        onToolRun: (toolRun) => patchConversation(conversationId, (conversation) => ({
+          ...conversation,
+          messages: conversation.messages.map((message) => message.id === placeholder.id
+            ? { ...message, toolRuns: [...(message.toolRuns ?? []), toolRun] }
+            : message),
+        })),
+        onSummary: (summary, coveredCount) => patchConversation(conversationId, (conversation) => ({
+          ...conversation, summary, summarizedCount: coveredCount,
+        })),
+      })
+
+      if (frame) cancelAnimationFrame(frame)
+      const stopped = controller.signal.aborted
+      const finalMessage: Message = {
+        ...placeholder,
+        content: answer || (stopped ? '' : '—'),
+        reasoning: reasoning || undefined,
+        usage: result.usage,
+        toolRuns: result.toolRuns,
+        stopped: stopped || undefined,
+      }
+      patchConversation(conversationId, (conversation) => ({
+        ...conversation,
         updatedAt: Date.now(),
+        messages: conversation.messages.map((message) => message.id === placeholder.id ? finalMessage : message),
       }))
 
-      const controller = new AbortController()
-      abortRef.current = controller
-      setStreaming(true)
-
-      let text = ''
-      let reasoning = ''
-      let frame = 0
-
-      const flush = () => {
-        frame = 0
-        patchConversation(convId, (c) => ({
-          ...c,
-          messages: c.messages.map((m) =>
-            m.id === placeholder.id ? { ...m, content: text, reasoning: reasoning || undefined } : m,
-          ),
-        }))
+      if (projectDraft && settings.autoMemory && !stopped && answer.trim()) {
+        const memoryProject = projectDraft
+        void extractFacts(config, model, memoryProject, [...history.slice(-1), finalMessage])
+          .then((facts) => {
+            if (facts.length) setProjects((list) => list.map((project) =>
+              project.id === memoryProject.id ? addFacts(project, facts, 'auto').project : project))
+          })
+          .catch(() => {})
       }
-
-      const schedule = () => {
-        if (frame === 0) frame = requestAnimationFrame(flush)
-      }
-
-      try {
-        const { usage } = await sendChat({
-          config,
-          model,
-          messages: history,
-          systemPrompt: settings.systemPrompt,
-          temperature: settings.temperature,
-          maxTokens: settings.maxTokens,
-          stream: settings.streaming,
-          signal: controller.signal,
-          onDelta: ({ text: t, reasoning: r }) => {
-            if (t) text += t
-            if (r) reasoning += r
-            schedule()
-          },
-        })
-
-        if (frame) cancelAnimationFrame(frame)
-        const stopped = controller.signal.aborted
-        patchConversation(convId, (c) => ({
-          ...c,
-          updatedAt: Date.now(),
-          messages: c.messages.map((m) =>
-            m.id === placeholder.id
-              ? {
-                  ...m,
-                  content: text || (stopped ? '' : '—'),
-                  reasoning: reasoning || undefined,
-                  usage,
-                  stopped: stopped || undefined,
-                }
-              : m,
-          ),
-        }))
-      } catch (err) {
-        if (frame) cancelAnimationFrame(frame)
-        const aborted = controller.signal.aborted
-        const message = err instanceof Error ? err.message : 'خطای ناشناخته رخ داد.'
-
-        patchConversation(convId, (c) => ({
-          ...c,
-          updatedAt: Date.now(),
-          messages: c.messages.map((m) =>
-            m.id === placeholder.id
-              ? aborted
-                ? { ...m, content: text, stopped: true }
-                : { ...m, content: message, error: true }
-              : m,
-          ),
-        }))
-        if (!aborted) toast('ارسال پیام ناموفق بود', 'error')
-      } finally {
-        abortRef.current = null
-        setStreaming(false)
-      }
-    },
-    [config, model, settings, patchConversation, toast],
-  )
+    } catch (error) {
+      if (frame) cancelAnimationFrame(frame)
+      const aborted = controller.signal.aborted
+      const message = error instanceof Error ? error.message : 'خطای ناشناخته رخ داد.'
+      patchConversation(conversationId, (conversation) => ({
+        ...conversation,
+        updatedAt: Date.now(),
+        messages: conversation.messages.map((item) => item.id === placeholder.id
+          ? aborted ? { ...item, content: answer, stopped: true } : { ...item, content: message, error: true }
+          : item),
+      }))
+      if (!aborted) toast('ارسال پیام ناموفق بود', 'error')
+    } finally {
+      abortRef.current = null
+      setStreaming(false)
+    }
+  }, [bridgeConfig, bridgeStatus, config, conversations, model, patchConversation, projects, requestApproval, settings, toast])
 
   const send = useCallback(async () => {
     const text = input.trim()
     if (!text || streaming || !config || !model) return
-
-    let convId = activeId
-    let base: Conversation
-
-    if (!convId || !conversations.some((c) => c.id === convId)) {
-      base = { ...createConversation(model), id: uid() }
-      convId = base.id
-      setConversations((list) => [base, ...list])
-      setActiveId(convId)
-    } else {
-      base = conversations.find((c) => c.id === convId)!
+    let conversation = active
+    if (!conversation) {
+      conversation = { ...createConversation(model), id: uid(), projectId: activeProjectId }
+      setConversations((list) => [conversation!, ...list])
+      setActiveId(conversation.id)
     }
-
-    const userMsg = createMessage('user', text)
-    const history = [...base.messages, userMsg]
-
-    patchConversation(convId, (c) => ({
-      ...c,
-      title: c.messages.length === 0 ? deriveTitle(text) : c.title,
-      messages: [...c.messages, userMsg],
+    const userMessage = createMessage('user', text)
+    const history = [...conversation.messages, userMessage]
+    patchConversation(conversation.id, (current) => ({
+      ...current,
+      title: current.messages.length === 0 ? deriveTitle(text) : current.title,
+      messages: [...current.messages, userMessage],
       updatedAt: Date.now(),
     }))
-
     setInput('')
     setAtBottom(true)
-    await runCompletion(convId, history)
-  }, [input, streaming, config, model, activeId, conversations, patchConversation, runCompletion])
+    await runCompletion(conversation.id, history)
+  }, [active, activeProjectId, config, input, model, patchConversation, runCompletion, streaming])
 
   const regenerate = useCallback(async () => {
     if (!active || streaming) return
     const messages = [...active.messages]
-    while (messages.length > 0 && messages[messages.length - 1].role === 'assistant') messages.pop()
-    if (messages.length === 0) return
-
-    patchConversation(active.id, (c) => ({ ...c, messages }))
+    while (messages.at(-1)?.role === 'assistant') messages.pop()
+    if (!messages.length) return
+    patchConversation(active.id, (conversation) => ({ ...conversation, messages }))
     await runCompletion(active.id, messages)
-  }, [active, streaming, patchConversation, runCompletion])
-
-  function stop() {
-    abortRef.current?.abort()
-  }
-
-  /* ------------------------------- shortcuts ------------------------------ */
+  }, [active, patchConversation, runCompletion, streaming])
 
   useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
-        e.preventDefault()
-        newChat()
-      }
-      if ((e.ctrlKey || e.metaKey) && e.key === '\\') {
-        e.preventDefault()
-        setSidebarOpen((v) => !v)
-      }
+    function onKey(event: KeyboardEvent) {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); newChat() }
+      if ((event.ctrlKey || event.metaKey) && event.key === '\\') { event.preventDefault(); setSidebarOpen((value) => !value) }
+      if (event.key === 'Escape' && isMobileViewport()) setSidebarOpen(false)
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [newChat])
 
-  /* -------------------------------- render -------------------------------- */
-
-  function handleConnected(cfg: ApiConfig, list: ModelInfo[]) {
-    storage.saveConfig(cfg)
-    setConfig(cfg)
+  function handleApiConnected(nextConfig: ApiConfig, list: ModelInfo[]) {
+    storage.saveConfig(nextConfig)
+    setConfig(nextConfig)
     setModels(list)
-    setModel((current) => (current && list.some((m) => m.id === current) ? current : list[0]?.id ?? ''))
+    setModel((current) => current && list.some((item) => item.id === current) ? current : list[0]?.id ?? '')
     setReconnecting(false)
-    toast('اتصال برقرار شد', 'success')
+    toast('اتصال مدل برقرار شد', 'success')
   }
 
   if (!config || reconnecting) {
-    return (
-      <>
-        <Setup
-          initial={config}
-          onConnected={handleConnected}
-          onCancel={config ? () => setReconnecting(false) : undefined}
-        />
-        {toastView}
-      </>
-    )
+    return <><Setup initial={config} onConnected={handleApiConnected} onCancel={config ? () => setReconnecting(false) : undefined} />{toastView}</>
   }
 
-  const mobile = typeof window !== 'undefined' && window.innerWidth <= 860
-
+  const providerLabel = config.provider === 'anthropic' ? 'Anthropic' : 'OpenAI compatible'
   return (
-    <div className="app">
+    <div className="app" style={{ '--sidebar-w': `${layout.sidebarWidth}px` } as CSSProperties}>
       {sidebarOpen && mobile && <div className="backdrop" onClick={() => setSidebarOpen(false)} />}
-
       <Sidebar
-        conversations={conversations}
-        activeId={activeId}
-        collapsed={!sidebarOpen}
-        theme={settings.theme}
+        conversations={conversations} projects={projects} activeId={activeId} activeProjectId={activeProjectId}
+        collapsed={!sidebarOpen} theme={settings.theme} providerLabel={providerLabel}
         onSelect={(id) => {
           setActiveId(id)
+          setActiveProjectId(conversations.find((conversation) => conversation.id === id)?.projectId ?? null)
           if (mobile) setSidebarOpen(false)
         }}
-        onNew={newChat}
-        onRename={renameConversation}
+        onNew={newChat} onNewProject={() => setProjectEditor({ id: null })} onOpenProject={openProject}
+        onRename={(id, title) => patchConversation(id, (conversation) => ({ ...conversation, title }))}
         onDelete={deleteConversation}
+        onTogglePin={(id) => patchConversation(id, (conversation) => ({ ...conversation, pinned: !conversation.pinned }))}
+        onMoveToProject={(id, projectId) => {
+          patchConversation(id, (conversation) => ({ ...conversation, projectId }))
+          if (id === activeId) setActiveProjectId(projectId)
+        }}
         onOpenSettings={() => setShowSettings(true)}
-        onToggleTheme={() =>
-          setSettings((s) => ({ ...s, theme: s.theme === 'dark' ? 'light' : 'dark' }))
-        }
+        onToggleTheme={() => setSettings((value) => ({ ...value, theme: value.theme === 'dark' ? 'light' : 'dark' }))}
+        onToggleCollapse={() => setSidebarOpen(false)}
         onDisconnect={() => setReconnecting(true)}
       />
-
+      {sidebarOpen && !mobile && (
+        <ResizeHandle
+          anchor="start"
+          width={layout.sidebarWidth}
+          min={220}
+          max={520}
+          label="تغییر عرض نوار کناری"
+          onResize={(sidebarWidth) => setLayout((value) => ({ ...value, sidebarWidth }))}
+        />
+      )}
       <main className="main">
         <header className="topbar">
-          <button
-            className="icon-btn"
-            onClick={() => setSidebarOpen((v) => !v)}
-            title="نمایش/پنهان کردن نوار کناری"
-            aria-label="نمایش یا پنهان کردن نوار کناری"
-          >
-            <IconSidebar />
-          </button>
-
-          <button className="icon-btn" onClick={newChat} title="گفتگوی جدید" aria-label="گفتگوی جدید">
-            <IconPlus />
-          </button>
-
+          <button className="icon-btn" onClick={() => setSidebarOpen((value) => !value)} title="نمایش/پنهان کردن نوار کناری" aria-label="نمایش یا پنهان کردن نوار کناری"><IconSidebar /></button>
+          <button className="icon-btn" onClick={newChat} title="گفتگوی جدید" aria-label="گفتگوی جدید"><IconPlus /></button>
+          {activeProject && (
+            <button className="project-pill" onClick={() => setProjectEditor({ id: activeProject.id })} title="جزئیات و حافظه‌ی پروژه">
+              <IconFolder size={14} />
+              <span>{activeProject.name}</span>
+              {activeProject.facts.length > 0 && <small>{toFa(activeProject.facts.length)} حافظه</small>}
+            </button>
+          )}
           <span className="topbar-title">{active?.title ?? 'گفتگوی جدید'}</span>
           <span className="topbar-spacer" />
-
-          <ModelPicker
-            models={models}
-            value={model}
-            loading={modelsLoading}
-            onChange={setModel}
-            onRefresh={() => config && refreshModels(config)}
-          />
+          {bridgeStatus && !mobile && (
+            <button
+              className={`icon-btn${settings.workspacePanel ? ' active' : ''}`}
+              onClick={() => setSettings((value) => ({ ...value, workspacePanel: !value.workspacePanel }))}
+              title="نمایش/پنهان کردن پنل Workspace"
+              aria-label="نمایش یا پنهان کردن پنل Workspace"
+            >
+              <IconPanel />
+            </button>
+          )}
+          <button className={`workspace-pill${bridgeStatus ? ' connected' : ''}`} onClick={() => setShowWorkspace(true)} title="اتصال Workspace، Git و GitHub">
+            <span className="status-dot" /><IconCode size={15} /><span>{bridgeStatus?.workspace.name ?? 'اتصال Workspace'}</span>
+            {bridgeStatus?.git.branch && <small><IconGitBranch size={11} />{bridgeStatus.git.branch}</small>}
+          </button>
+          <ModelPicker models={models} value={model} loading={modelsLoading} onChange={setModel} onRefresh={() => refreshModels(config)} />
         </header>
 
-        {!active || active.messages.length === 0 ? (
-          <Welcome onPick={(text) => setInput(text)} />
-        ) : (
-          <div className="scroll-area" ref={scrollRef} onScroll={handleScroll}>
-            <div className="thread">
-              {active.messages.map((m, i) => (
-                <ChatMessage
-                  key={m.id}
-                  message={m}
-                  streaming={streaming && i === active.messages.length - 1 && m.role === 'assistant'}
-                  onRegenerate={i === active.messages.length - 1 ? regenerate : undefined}
-                />
-              ))}
-            </div>
-          </div>
+        {!active || active.messages.length === 0 ? <Welcome onPick={setInput} /> : (
+          <div className="scroll-area" ref={scrollRef} onScroll={handleScroll}><div className="thread">
+            {active.messages.map((message, index) => <ChatMessage
+              key={message.id} message={message}
+              streaming={streaming && index === active.messages.length - 1 && message.role === 'assistant'}
+              onRegenerate={index === active.messages.length - 1 ? regenerate : undefined}
+            />)}
+          </div></div>
         )}
 
         <div className="composer-wrap">
-          {!atBottom && active && active.messages.length > 0 && (
-            <button
-              className="scroll-bottom"
-              onClick={() => scrollToBottom()}
-              aria-label="رفتن به انتهای گفتگو"
-            >
-              <IconArrowDown />
-            </button>
-          )}
-
-          <Composer
-            value={input}
-            streaming={streaming}
-            disabled={!model}
-            sendOnEnter={settings.sendOnEnter}
-            onChange={setInput}
-            onSend={send}
-            onStop={stop}
-          />
+          {!atBottom && active && active.messages.length > 0 && <button className="scroll-bottom" onClick={() => scrollToBottom()} aria-label="رفتن به انتهای گفتگو"><IconArrowDown /></button>}
+          <Composer value={input} streaming={streaming} disabled={!model} sendOnEnter={settings.sendOnEnter} onChange={setInput} onSend={send} onStop={() => abortRef.current?.abort()} />
         </div>
       </main>
 
-      {showSettings && (
-        <SettingsModal
-          settings={settings}
-          config={config}
-          onSave={(s) => {
-            setSettings(s)
-            setShowSettings(false)
-            toast('تنظیمات ذخیره شد', 'success')
-          }}
-          onClose={() => setShowSettings(false)}
-          onClearHistory={clearHistory}
-        />
+      {bridgeConfig && bridgeStatus && settings.workspacePanel && !mobile && (
+        <>
+          <ResizeHandle
+            anchor="end"
+            width={layout.panelWidth}
+            min={300}
+            max={860}
+            label="تغییر عرض پنل Workspace"
+            onResize={(panelWidth) => setLayout((value) => ({ ...value, panelWidth }))}
+          />
+          <WorkspacePanel
+            config={bridgeConfig}
+            status={bridgeStatus}
+            width={layout.panelWidth}
+            event={bridgeEvent}
+            onClose={() => setSettings((value) => ({ ...value, workspacePanel: false }))}
+            onNotify={toast}
+          />
+        </>
       )}
 
+      {showSettings && <SettingsModal settings={settings} config={config} onSave={(next) => { setSettings(next); setShowSettings(false); toast('تنظیمات ذخیره شد', 'success') }} onClose={() => setShowSettings(false)} onClearHistory={clearHistory} />}
+      {showWorkspace && <WorkspaceModal
+        initial={bridgeConfig} status={bridgeStatus}
+        approvalMode={settings.approvalMode}
+        onApprovalModeChange={(mode) => setSettings((value) => ({ ...value, approvalMode: mode }))}
+        onConnected={(nextConfig, status) => {
+          storage.saveBridgeConfig(nextConfig); setBridgeConfig(nextConfig); setBridgeStatus(status); setShowWorkspace(false)
+          setSettings((value) => ({ ...value, workspacePanel: true }))
+          toast(`Workspace «${status.workspace.name}» متصل شد`, 'success')
+        }}
+        onDisconnect={() => {
+          storage.clearBridgeConfig(); setBridgeConfig(null); setBridgeStatus(null); setShowWorkspace(false)
+          toast('اتصال Workspace قطع شد', 'success')
+        }}
+        onClose={() => setShowWorkspace(false)}
+      />}
+      {projectEditor && <ProjectModal
+        project={projectEditor.id ? projects.find((project) => project.id === projectEditor.id) ?? null : null}
+        chats={conversations.filter((item) => item.projectId === projectEditor.id)}
+        onSave={saveProject}
+        onDelete={deleteProject}
+        onOpenChat={(id) => { setActiveId(id); setProjectEditor(null) }}
+        onClose={() => setProjectEditor(null)}
+      />}
+      {approval && <ApprovalDialog request={approval} onDecide={decideApproval} />}
       {toastView}
     </div>
   )

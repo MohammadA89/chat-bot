@@ -1,8 +1,31 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import type { Message } from '../types'
 import { Markdown } from './Markdown'
+import { hasInlineThinking, splitThinking } from '../lib/thinking'
 import { copyText, formatClock, formatNumber } from '../lib/utils'
-import { IconAlert, IconBrain, IconCheck, IconChevronLeft, IconCopy, IconRefresh } from './Icons'
+import { IconAlert, IconBrain, IconCheck, IconChevronLeft, IconCopy, IconRefresh, IconWrench } from './Icons'
+
+const TOOL_LABELS: Record<string, string> = {
+  workspace_list: 'فهرست فایل‌ها',
+  workspace_read: 'خواندن فایل',
+  workspace_search: 'جستجو در کد',
+  workspace_create: 'ساخت فایل',
+  workspace_edit: 'ویرایش فایل',
+  terminal_run: 'اجرای ترمینال',
+  git_status: 'وضعیت Git',
+  git_diff: 'تغییرات Git',
+  git_log: 'تاریخچه Git',
+  github_repo: 'مخزن GitHub',
+  github_issues: 'Issueهای GitHub',
+  github_issue: 'جزئیات Issue',
+  github_prs: 'Pull Requestهای GitHub',
+  remember: 'حافظه پروژه',
+  forget: 'حذف از حافظه',
+  read_project_file: 'خواندن فایل پروژه',
+  write_project_file: 'نوشتن فایل پروژه',
+  search_chats: 'جستجو در گفتگوها',
+  set_chat_title: 'عنوان گفتگو',
+}
 
 interface ChatMessageProps {
   message: Message
@@ -13,16 +36,32 @@ interface ChatMessageProps {
 export function ChatMessage({ message, streaming, onRegenerate }: ChatMessageProps) {
   const [copied, setCopied] = useState(false)
   const [showReasoning, setShowReasoning] = useState(false)
+  const [showTools, setShowTools] = useState(false)
   const isUser = message.role === 'user'
 
+  // Conversations saved before inline `<think>` blocks were split out still
+  // carry them in `content`; peel them apart at render time.
+  const { content, reasoning } = useMemo(() => {
+    if (isUser || message.error || !hasInlineThinking(message.content)) {
+      return { content: message.content, reasoning: message.reasoning?.trim() }
+    }
+    const split = splitThinking(message.content)
+    return {
+      content: split.text,
+      reasoning: [message.reasoning, split.reasoning].filter(Boolean).join('\n\n').trim(),
+    }
+  }, [isUser, message.content, message.error, message.reasoning])
+
   async function handleCopy() {
-    if (await copyText(message.content)) {
+    if (await copyText(content)) {
       setCopied(true)
       setTimeout(() => setCopied(false), 1600)
     }
   }
 
-  const empty = message.content.trim() === ''
+  const empty = content.trim() === ''
+  /** Reasoning is still arriving and the answer hasn't started. */
+  const thinking = streaming && empty && !!reasoning
 
   return (
     <article className={`msg ${isUser ? 'user' : 'assistant'}`}>
@@ -42,36 +81,64 @@ export function ChatMessage({ message, streaming, onRegenerate }: ChatMessagePro
           )}
         </div>
 
-        {message.reasoning && (
-          <div className="reasoning">
+        {reasoning && (
+          <div className={`reasoning${thinking ? ' thinking' : ''}`}>
             <button
               className={`reasoning-toggle${showReasoning ? ' open' : ''}`}
               onClick={() => setShowReasoning((v) => !v)}
+              aria-expanded={showReasoning}
             >
               <IconBrain />
-              <span>زنجیره‌ی استدلال مدل</span>
+              <span>{thinking ? 'در حال فکر کردن…' : 'زنجیره‌ی استدلال مدل'}</span>
+              <span className="reasoning-hint">{showReasoning ? 'بستن' : 'نمایش'}</span>
               <IconChevronLeft className="chev" />
             </button>
-            {showReasoning && <div className="reasoning-content">{message.reasoning}</div>}
+            {showReasoning && (
+              <div className="reasoning-content">
+                {reasoning}
+                {thinking && <span className="caret" />}
+              </div>
+            )}
+          </div>
+        )}
+
+        {!!message.toolRuns?.length && (
+          <div className="tool-runs">
+            <button className="tool-runs-toggle" onClick={() => setShowTools((value) => !value)} aria-expanded={showTools}>
+              <IconWrench />
+              <span>{formatNumber(message.toolRuns.length)} ابزار اجرا شد</span>
+              <span className="reasoning-hint">{showTools ? 'بستن' : 'جزئیات'}</span>
+              <IconChevronLeft className={`chev${showTools ? ' open' : ''}`} />
+            </button>
+            {showTools && <div className="tool-runs-list">
+              {message.toolRuns.map((run) => <details key={run.id} className={run.ok ? 'ok' : 'failed'}>
+                <summary><span className="tool-state">{run.ok ? '✓' : '!'}</span>{TOOL_LABELS[run.name] ?? run.name}</summary>
+                <pre>{run.output}</pre>
+              </details>)}
+            </div>}
           </div>
         )}
 
         {message.error ? (
           <div className="alert alert-error">
             <IconAlert />
-            <span>{message.content}</span>
+            <span>{content}</span>
           </div>
         ) : isUser ? (
-          <div className="msg-content">{message.content}</div>
+          <div className="msg-content">{content}</div>
         ) : empty && streaming ? (
-          <div className="typing">
-            <span />
-            <span />
-            <span />
-          </div>
+          // While the model is thinking the reasoning panel above already shows
+          // progress, so the dots would just be noise.
+          thinking ? null : (
+            <div className="typing">
+              <span />
+              <span />
+              <span />
+            </div>
+          )
         ) : (
           <div className="msg-content">
-            <Markdown content={message.content} />
+            <Markdown content={content} />
             {streaming && <span className="caret" />}
           </div>
         )}
