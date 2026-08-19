@@ -159,8 +159,15 @@ export interface ToolCall {
  * A turn as it goes on the wire. The harness builds these from `Message`s so
  * tool traffic can be replayed to the model without polluting the UI history.
  */
+/** An image handed to the model, already decoded out of its data URL. */
+export interface WireImage {
+  mimeType: string
+  /** Raw base64 payload, without the `data:…;base64,` prefix. */
+  data: string
+}
+
 export type WireMessage =
-  | { role: 'user'; content: string }
+  | { role: 'user'; content: string; images?: WireImage[] }
   | { role: 'assistant'; content: string; toolCalls?: ToolCall[] }
   | { role: 'tool'; toolCallId: string; name: string; content: string }
 
@@ -184,15 +191,31 @@ export interface ChatResult {
   toolCalls: ToolCall[]
 }
 
+/** Splits a stored `data:<mime>;base64,<payload>` URL into its two halves. */
+export function parseDataUrl(url: string): WireImage | null {
+  const match = /^data:([^;,]+);base64,(.+)$/s.exec(url.trim())
+  if (!match) return null
+  return { mimeType: match[1], data: match[2] }
+}
+
+/** Images of a message, ready for the wire; attachments dropped by storage are skipped. */
+function wireImages(message: Message): WireImage[] {
+  return (message.attachments ?? [])
+    .map((a) => (a.dataUrl ? parseDataUrl(a.dataUrl) : null))
+    .filter((image): image is WireImage => image !== null)
+}
+
 /** Strips inline `<think>` blocks; the model only needs the answer back. */
 export function toWireMessages(messages: Message[]): WireMessage[] {
   return messages
     .filter((m) => m.role !== 'system' && !m.error)
-    .map((m) => ({
-      role: m.role as 'user' | 'assistant',
-      content: splitThinking(m.content).text,
-    }))
-    .filter((m) => m.content.trim() !== '')
+    .map((m) => {
+      const content = splitThinking(m.content).text
+      if (m.role !== 'user') return { role: 'assistant' as const, content }
+      const images = wireImages(m)
+      return { role: 'user' as const, content, ...(images.length ? { images } : {}) }
+    })
+    .filter((m) => m.content.trim() !== '' || ('images' in m && m.images?.length))
 }
 
 function parseArgs(raw: string): Record<string, unknown> {
@@ -218,6 +241,18 @@ function openAiMessages(messages: WireMessage[]) {
           type: 'function' as const,
           function: { name: t.name, arguments: t.arguments || '{}' },
         })),
+      }
+    }
+    if (m.role === 'user' && m.images?.length) {
+      return {
+        role: 'user' as const,
+        content: [
+          ...(m.content.trim() ? [{ type: 'text' as const, text: m.content }] : []),
+          ...m.images.map((image) => ({
+            type: 'image_url' as const,
+            image_url: { url: `data:${image.mimeType};base64,${image.data}` },
+          })),
+        ],
       }
     }
     return { role: m.role, content: m.content }
@@ -246,6 +281,19 @@ function anthropicMessages(messages: WireMessage[]) {
         content.push({ type: 'tool_use', id: t.id, name: t.name, input: parseArgs(t.arguments) })
       }
       out.push({ role: 'assistant', content })
+      continue
+    }
+    if (m.role === 'user' && m.images?.length) {
+      out.push({
+        role: 'user',
+        content: [
+          ...m.images.map((image) => ({
+            type: 'image',
+            source: { type: 'base64', media_type: image.mimeType, data: image.data },
+          })),
+          ...(m.content.trim() ? [{ type: 'text', text: m.content }] : []),
+        ],
+      })
       continue
     }
     out.push({ role: m.role, content: m.content })

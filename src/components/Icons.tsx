@@ -359,3 +359,12 @@ export const IconFolderOpen = ({ size = 15, className }: IconProps) => (
     <path d="M3.6 10h16.8l-2 8.5a1.5 1.5 0 0 1-1.5 1.2H5.9a1.5 1.5 0 0 1-1.5-1.2L3.6 10Z" />
   </svg>
 )
+
+export const IconImage = ({ size = 17, className }: IconProps) => (
+  <svg {...base(size)} className={className}>
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <circle cx="8.5" cy="9.5" r="1.6" />
+    <path d="m4 17 4.5-4.5a2 2 0 0 1 2.8 0L16 17" />
+    <path d="m14 15 1.8-1.8a2 2 0 0 1 2.8 0L20 14.5" />
+  </svg>
+)

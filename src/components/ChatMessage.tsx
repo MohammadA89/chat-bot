@@ -3,7 +3,7 @@ import type { Message } from '../types'
 import { Markdown } from './Markdown'
 import { hasInlineThinking, splitThinking } from '../lib/thinking'
 import { copyText, formatClock, formatNumber } from '../lib/utils'
-import { IconAlert, IconBrain, IconCheck, IconChevronLeft, IconCopy, IconRefresh, IconWrench } from './Icons'
+import { IconAlert, IconBrain, IconCheck, IconChevronLeft, IconCopy, IconImage, IconRefresh, IconWrench } from './Icons'
 
 const TOOL_LABELS: Record<string, string> = {
   workspace_list: 'فهرست فایل‌ها',
@@ -37,6 +37,8 @@ export function ChatMessage({ message, streaming, onRegenerate }: ChatMessagePro
   const [copied, setCopied] = useState(false)
   const [showReasoning, setShowReasoning] = useState(false)
   const [showTools, setShowTools] = useState(false)
+  /** Data URL of the image opened full-screen, if any. */
+  const [preview, setPreview] = useState<string | null>(null)
   const isUser = message.role === 'user'
 
   // Conversations saved before inline `<think>` blocks were split out still
@@ -119,6 +121,29 @@ export function ChatMessage({ message, streaming, onRegenerate }: ChatMessagePro
           </div>
         )}
 
+        {!!message.attachments?.length && (
+          <div className="msg-attachments">
+            {message.attachments.map((attachment) => (
+              attachment.dataUrl ? (
+                <button
+                  key={attachment.id}
+                  className="msg-attachment"
+                  onClick={() => setPreview(attachment.dataUrl!)}
+                  title={attachment.name}
+                >
+                  <img src={attachment.dataUrl} alt={attachment.name} />
+                </button>
+              ) : (
+                // The image was dropped to keep the saved history inside quota.
+                <div className="msg-attachment missing" key={attachment.id} title={attachment.name}>
+                  <IconImage size={18} />
+                  <span>تصویر ذخیره نشد</span>
+                </div>
+              )
+            ))}
+          </div>
+        )}
+
         {message.error ? (
           <div className="alert alert-error">
             <IconAlert />
@@ -160,6 +185,12 @@ export function ChatMessage({ message, streaming, onRegenerate }: ChatMessagePro
           </div>
         )}
       </div>
+
+      {preview && (
+        <div className="lightbox" onClick={() => setPreview(null)} role="presentation">
+          <img src={preview} alt="" />
+        </div>
+      )}
     </article>
   )
 }

@@ -151,6 +151,20 @@ export interface ModelInfo {
   created?: number
 }
 
+/** An image the user attached to a message, kept inline as a data URL. */
+export interface Attachment {
+  id: string
+  name: string
+  /** e.g. `image/png`. Only image types are accepted today. */
+  mimeType: string
+  /** Byte size of the (already downscaled) image. */
+  size: number
+  width?: number
+  height?: number
+  /** `data:<mime>;base64,…`. Absent when storage had to drop it to fit quota. */
+  dataUrl?: string
+}
+
 export interface Usage {
   input: number
   output: number
@@ -172,6 +186,8 @@ export interface Message {
   content: string
   /** Chain-of-thought / reasoning text, when the model exposes it. */
   reasoning?: string
+  /** Images sent along with this turn. */
+  attachments?: Attachment[]
   createdAt: number
   model?: string
   usage?: Usage
