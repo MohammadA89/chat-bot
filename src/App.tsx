@@ -169,14 +169,24 @@ export default function App() {
   useEffect(() => {
     if (config && models.length === 0) void refreshModels(config, true)
   }, [config, models.length, refreshModels])
+  /**
+   * Opening a chat restores the model it was last answered with.
+   *
+   * This deliberately does not react to `active.model` itself: the picker is
+   * the only writer (see `selectModel`), and an effect that mirrored the value
+   * back would fight it — switching to a chat saved with another model used to
+   * leave the two effects overwriting each other every render.
+   */
   useEffect(() => {
-    if (active && model && active.model !== model) {
-      setConversations((list) => list.map((item) => item.id === active.id ? { ...item, model } : item))
-    }
-  }, [active, model])
-  useEffect(() => {
-    if (active?.model && models.some((item) => item.id === active.model)) setModel(active.model)
-  }, [activeId, active?.model, models])
+    const saved = active?.model
+    if (saved && models.some((item) => item.id === saved)) setModel(saved)
+  }, [activeId, models]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  /** Choosing a model applies it to the open chat as well, in one direction. */
+  const selectModel = useCallback((id: string) => {
+    setModel(id)
+    setConversations((list) => list.map((item) => item.id === activeId ? { ...item, model: id } : item))
+  }, [activeId])
 
   const scrollToBottom = useCallback((smooth = true) => {
     const element = scrollRef.current
@@ -249,8 +259,10 @@ export default function App() {
     const snapshot = conversations.find((item) => item.id === conversationId)
     if (!snapshot) return
     const placeholder = createMessage('assistant', '', { model, toolRuns: [] })
+    // `model` is recorded here too, so reopening the chat later restores the
+    // model it was actually answered with.
     patchConversation(conversationId, (conversation) => ({
-      ...conversation, messages: [...conversation.messages, placeholder], updatedAt: Date.now(),
+      ...conversation, model, messages: [...conversation.messages, placeholder], updatedAt: Date.now(),
     }))
 
     const controller = new AbortController()
@@ -487,7 +499,7 @@ export default function App() {
             <span className="status-dot" /><IconCode size={15} /><span>{bridgeStatus?.workspace.name ?? 'اتصال Workspace'}</span>
             {bridgeStatus?.git.branch && <small><IconGitBranch size={11} />{bridgeStatus.git.branch}</small>}
           </button>
-          <ModelPicker models={models} value={model} loading={modelsLoading} onChange={setModel} onRefresh={() => refreshModels(config)} />
+          <ModelPicker models={models} value={model} loading={modelsLoading} onChange={selectModel} onRefresh={() => refreshModels(config)} />
         </header>
 
         {!active || active.messages.length === 0 ? <Welcome onPick={setInput} /> : (
