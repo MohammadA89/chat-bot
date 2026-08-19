@@ -3,11 +3,38 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
+  "description": "چت‌بات حرفه‌ای وب با پشتیبانی از APIهای سازگار با OpenAI و Anthropic",
+  "license": "MIT",
+  "author": "Mohammad",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MohammadA89/chat-bot.git"
+  },
+  "homepage": "https://github.com/MohammadA89/chat-bot#readme",
+  "bugs": {
+    "url": "https://github.com/MohammadA89/chat-bot/issues"
+  },
+  "keywords": [
+    "coding-agent",
+    "rtl",
+    "persian",
+    "openai",
+    "anthropic",
+    "vscode",
+    "cursor",
+    "vite",
+    "react"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "mock": "node scripts/mock-api.mjs"
+    "mock": "node scripts/mock-api.mjs",
+    "bridge": "node scripts/local-bridge.mjs",
+    "bridge:self-test": "node scripts/local-bridge.mjs --self-test"
   },
   "dependencies": {
     "highlight.js": "^11.10.0",
@@ -26,6 +53,5 @@
     "@vitejs/plugin-react": "^4.3.3",
     "typescript": "^5.6.3",
     "vite": "^5.4.10"
-  },
-  "description": "چت‌بات حرفه‌ای وب با پشتیبانی از APIهای سازگار با OpenAI و Anthropic"
+  }
 }
