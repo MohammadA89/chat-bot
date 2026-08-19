@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   BridgeConfig,
   BridgeEvent,
@@ -8,8 +8,9 @@ import type {
   ShellJob,
   WorkspaceEntry,
   WorkspaceFile,
+  WorkspaceInfo,
 } from '../types'
-import { callBridge, gitApi, shellApi, workspaceApi } from '../lib/bridge'
+import { callBridge, gitApi, shellApi, workspaceApi, type BridgeTarget } from '../lib/bridge'
 import { formatBytes, languageForPath } from '../lib/diff'
 import { copyText, toFa } from '../lib/utils'
 import { CodeView, DiffView } from './DiffView'
@@ -40,6 +41,8 @@ type Tab = 'files' | 'changes' | 'terminal' | 'github'
 interface WorkspacePanelProps {
   config: BridgeConfig
   status: BridgeStatus
+  /** The single root this panel and all of its actions are scoped to. */
+  workspace: WorkspaceInfo
   /** Current dock width in pixels, driven by the drag handle beside it. */
   width: number
   /** The most recent sidecar event; the panel refreshes the views it touches. */
@@ -55,8 +58,9 @@ const TABS: Array<{ id: Tab; label: string; icon: JSX.Element }> = [
   { id: 'github', label: 'GitHub', icon: <IconGithub /> },
 ]
 
-export function WorkspacePanel({ config, status, width, event, onClose, onNotify }: WorkspacePanelProps) {
+export function WorkspacePanel({ config, status, workspace, width, event, onClose, onNotify }: WorkspacePanelProps) {
   const [tab, setTab] = useState<Tab>('files')
+  const target = useMemo<BridgeTarget>(() => ({ config, workspace: workspace.id }), [config, workspace.id])
 
   const fail = useCallback(
     (error: unknown, fallback: string) =>
@@ -70,18 +74,18 @@ export function WorkspacePanel({ config, status, width, event, onClose, onNotify
         <div className="wp-identity">
           <IconFolderOpen />
           <div>
-            <strong>{status.workspace.name}</strong>
-            <small title={status.workspace.root}>{status.workspace.root}</small>
+            <strong>{workspace.name}</strong>
+            <small title={workspace.root}>{workspace.root}</small>
           </div>
         </div>
         <button className="icon-btn" onClick={onClose} aria-label="بستن پنل Workspace"><IconX /></button>
       </header>
 
       <div className="wp-meta">
-        {status.git.available && (
-          <span className="wp-chip"><IconGitBranch />{status.git.branch}</span>
+        {workspace.git.available && (
+          <span className="wp-chip"><IconGitBranch />{workspace.git.branch}</span>
         )}
-        {status.editors?.filter((editor) => editor.cliAvailable || editor.workspaceMarker).map((editor) => (
+        {workspace.editors?.filter((editor) => editor.cliAvailable || editor.workspaceMarker).map((editor) => (
           <span className="wp-chip" key={editor.id}>{editor.name}</span>
         ))}
         <span className={`wp-chip${status.capabilities.write ? ' on' : ''}`}>
@@ -106,10 +110,10 @@ export function WorkspacePanel({ config, status, width, event, onClose, onNotify
       </nav>
 
       <div className="wp-body">
-        {tab === 'files' && <FilesTab config={config} event={event} onError={fail} onNotify={onNotify} />}
-        {tab === 'changes' && <ChangesTab config={config} status={status} event={event} onError={fail} onNotify={onNotify} />}
-        {tab === 'terminal' && <TerminalTab config={config} status={status} event={event} onError={fail} />}
-        {tab === 'github' && <GithubTab config={config} status={status} onError={fail} />}
+        {tab === 'files' && <FilesTab target={target} event={event} onError={fail} onNotify={onNotify} />}
+        {tab === 'changes' && <ChangesTab target={target} status={status} workspace={workspace} event={event} onError={fail} onNotify={onNotify} />}
+        {tab === 'terminal' && <TerminalTab target={target} status={status} event={event} onError={fail} />}
+        {tab === 'github' && <GithubTab target={target} workspace={workspace} onError={fail} />}
       </div>
     </aside>
   )
@@ -120,7 +124,7 @@ export function WorkspacePanel({ config, status, width, event, onClose, onNotify
 /* -------------------------------------------------------------------------- */
 
 interface TabProps {
-  config: BridgeConfig
+  target: BridgeTarget
   onError(error: unknown, fallback: string): void
 }
 
@@ -131,7 +135,7 @@ interface SearchHit {
 }
 
 function FilesTab({
-  config,
+  target,
   event,
   onError,
   onNotify,
@@ -146,23 +150,24 @@ function FilesTab({
 
   const loadFolder = useCallback(async (path: string) => {
     try {
-      const result = await workspaceApi.children(config, path)
+      const result = await workspaceApi.children(target, path)
       setFolders((current) => ({ ...current, [path]: result.entries }))
     } catch (error) {
       onError(error, 'خواندن پوشه ناموفق بود.')
     }
-  }, [config, onError])
+  }, [target, onError])
 
   useEffect(() => { void loadFolder('.') }, [loadFolder])
 
   // A file the sidecar reports as changed is re-read only if it is on screen.
   useEffect(() => {
     if (event?.type !== 'fs.change') return
+    if (event.payload.workspace && event.payload.workspace !== target.workspace) return
     const changed = event.payload.path
     const parent = changed.includes('/') ? changed.slice(0, changed.lastIndexOf('/')) : '.'
     if (folders[parent]) void loadFolder(parent)
     if (file && file.path === changed) {
-      void workspaceApi.read(config, changed).then(setFile).catch(() => {})
+      void workspaceApi.read(target, changed).then(setFile).catch(() => {})
     }
   }, [event]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -179,21 +184,21 @@ function FilesTab({
   const openFile = useCallback(async (path: string, line?: number) => {
     setBusy(true)
     try {
-      setFile(await workspaceApi.read(config, path))
+      setFile(await workspaceApi.read(target, path))
       setActiveLine(line)
     } catch (error) {
       onError(error, 'خواندن فایل ناموفق بود.')
     } finally {
       setBusy(false)
     }
-  }, [config, onError])
+  }, [target, onError])
 
   async function search(event_: React.FormEvent) {
     event_.preventDefault()
     if (query.trim().length < 2) return
     setBusy(true)
     try {
-      const result = await workspaceApi.search(config, { query: query.trim(), maxResults: 80 })
+      const result = await workspaceApi.search(target, { query: query.trim(), maxResults: 80 })
       setHits(result.matches)
     } catch (error) {
       onError(error, 'جستجو ناموفق بود.')
@@ -204,7 +209,7 @@ function FilesTab({
 
   async function openInEditor(path: string, line?: number) {
     try {
-      const result = await workspaceApi.openInEditor(config, path, line)
+      const result = await workspaceApi.openInEditor(target, path, line)
       onNotify(`در ${result.editor} باز شد`, 'success')
     } catch (error) {
       onError(error, 'باز کردن در ادیتور ناموفق بود.')
@@ -317,13 +322,15 @@ function changeState(file: GitFileChange): string {
 }
 
 function ChangesTab({
-  config,
+  target,
   status,
+  workspace,
   event,
   onError,
   onNotify,
 }: TabProps & {
   status: BridgeStatus
+  workspace: WorkspaceInfo
   event: BridgeEvent | null
   onNotify(message: string, tone: 'success' | 'error'): void
 }) {
@@ -335,27 +342,27 @@ function ChangesTab({
 
   const refresh = useCallback(async () => {
     try {
-      const next = await gitApi.status(config)
+      const next = await gitApi.status(target)
       setGit(next)
       setSelected((current) => (current && next.files.some((file) => file.path === current) ? current : null))
     } catch (error) {
       onError(error, 'خواندن وضعیت Git ناموفق بود.')
     }
-  }, [config, onError])
+  }, [target, onError])
 
   useEffect(() => { void refresh() }, [refresh])
   useEffect(() => {
-    if (event?.type === 'fs.change') void refresh()
+    if (event?.type === 'fs.change' && (!event.payload.workspace || event.payload.workspace === target.workspace)) void refresh()
   }, [event]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!selected) return setDiff('')
     let cancelled = false
-    void gitApi.diff(config, { path: selected })
+    void gitApi.diff(target, { path: selected })
       .then((result) => { if (!cancelled) setDiff(result.stdout) })
       .catch(() => { if (!cancelled) setDiff('') })
     return () => { cancelled = true }
-  }, [config, selected])
+  }, [target, selected])
 
   async function act(action: () => Promise<unknown>, success: string, fallback: string) {
     setBusy(true)
@@ -370,7 +377,7 @@ function ChangesTab({
     }
   }
 
-  if (!status.git.available) return <p className="panel-empty">این Workspace یک مخزن Git نیست.</p>
+  if (!workspace.git.available) return <p className="panel-empty">این Workspace یک مخزن Git نیست.</p>
   if (!git) return <p className="panel-empty"><span className="spinner" /> در حال خواندن وضعیت…</p>
 
   const staged = git.files.filter((file) => file.staged)
@@ -393,7 +400,7 @@ function ChangesTab({
             disabled={busy}
             title={file.staged ? 'خارج کردن از staging' : 'افزودن به staging'}
             onClick={() => act(
-              () => (file.staged ? gitApi.unstage(config, file.path) : gitApi.stage(config, [file.path])),
+              () => (file.staged ? gitApi.unstage(target, file.path) : gitApi.stage(target, [file.path])),
               file.staged ? 'از staging خارج شد' : 'به staging اضافه شد',
               'تغییر staging ناموفق بود.',
             )}
@@ -416,7 +423,7 @@ function ChangesTab({
               formEvent.preventDefault()
               if (message.trim().length < 3 || git.clean) return
               void act(
-                () => gitApi.commit(config, message.trim(), staged.length === 0),
+                () => gitApi.commit(target, message.trim(), staged.length === 0),
                 'commit ثبت شد',
                 'ثبت commit ناموفق بود.',
               ).then(() => setMessage(''))
@@ -484,7 +491,7 @@ function ChangesTab({
 /* -------------------------------------------------------------------------- */
 
 function TerminalTab({
-  config,
+  target,
   status,
   event,
   onError,
@@ -503,14 +510,18 @@ function TerminalTab({
   // Live output arrives over the event stream; polling is only the fallback.
   useEffect(() => {
     if (!event || !job) return
-    if (event.type === 'job.output' && event.payload.id === job.id) setOutput((current) => current + event.payload.chunk)
-    if (event.type === 'job.end' && event.payload.id === job.id) setJob(event.payload)
+    if (event.type === 'job.output' && event.payload.id === job.id && (!event.payload.workspace || event.payload.workspace === target.workspace)) {
+      setOutput((current) => current + event.payload.chunk)
+    }
+    if (event.type === 'job.end' && event.payload.id === job.id && (!event.payload.workspace || event.payload.workspace === target.workspace)) {
+      setJob(event.payload)
+    }
   }, [event, job])
 
   useEffect(() => {
     if (!job?.running) return
     const timer = setInterval(() => {
-      void shellApi.poll(config, job.id, output.length)
+      void shellApi.poll(target, job.id, output.length)
         .then((result) => {
           if (result.output) setOutput((current) => current + result.output)
           if (!result.running) setJob(result)
@@ -518,7 +529,7 @@ function TerminalTab({
         .catch(() => {})
     }, 1500)
     return () => clearInterval(timer)
-  }, [config, job, output.length])
+  }, [target, job, output.length])
 
   if (!status.capabilities.shell) {
     return (
@@ -536,7 +547,7 @@ function TerminalTab({
     setCommand('')
     setHistory((current) => [value, ...current.filter((item) => item !== value)].slice(0, 12))
     try {
-      setJob(await shellApi.start(config, value))
+      setJob(await shellApi.start(target, value))
     } catch (error) {
       onError(error, 'اجرای دستور ناموفق بود.')
     }
@@ -556,7 +567,7 @@ function TerminalTab({
           <button
             className="btn btn-danger"
             type="button"
-            onClick={() => shellApi.kill(config, job.id).then(setJob).catch((error) => onError(error, 'توقف ناموفق بود.'))}
+            onClick={() => shellApi.kill(target, job.id).then(setJob).catch((error) => onError(error, 'توقف ناموفق بود.'))}
           >
             <IconStop size={14} /> توقف
           </button>
@@ -608,19 +619,19 @@ interface IssueRow {
   headRefName?: string
 }
 
-function GithubTab({ config, status, onError }: TabProps & { status: BridgeStatus }) {
+function GithubTab({ target, workspace, onError }: TabProps & { workspace: WorkspaceInfo }) {
   const [repo, setRepo] = useState<RepoInfo | null>(null)
   const [issues, setIssues] = useState<IssueRow[]>([])
   const [prs, setPrs] = useState<IssueRow[]>([])
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    if (!status.github.available) return setLoading(false)
+    if (!workspace.github.available) return setLoading(false)
     let cancelled = false
     void Promise.all([
-      callBridge<RepoInfo>(config, 'github.repo'),
-      callBridge<{ items: IssueRow[] }>(config, 'github.issues', { limit: 15 }),
-      callBridge<{ items: IssueRow[] }>(config, 'github.prs', { limit: 15 }),
+      callBridge<RepoInfo>(target.config, 'github.repo', { workspace: target.workspace }),
+      callBridge<{ items: IssueRow[] }>(target.config, 'github.issues', { workspace: target.workspace, limit: 15 }),
+      callBridge<{ items: IssueRow[] }>(target.config, 'github.prs', { workspace: target.workspace, limit: 15 }),
     ])
       .then(([repoInfo, issueList, prList]) => {
         if (cancelled) return
@@ -631,9 +642,9 @@ function GithubTab({ config, status, onError }: TabProps & { status: BridgeStatu
       .catch((error) => { if (!cancelled) onError(error, 'خواندن اطلاعات GitHub ناموفق بود.') })
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
-  }, [config, status.github.available, onError])
+  }, [target, workspace.github.available, onError])
 
-  if (!status.github.available) {
+  if (!workspace.github.available) {
     return (
       <p className="panel-empty">
         <IconAlert /> GitHub متصل نیست. در ترمینال <code dir="ltr">gh auth login</code> را اجرا کنید و دوباره وصل شوید.

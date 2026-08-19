@@ -6,6 +6,7 @@ import type {
   Project,
   ProjectFact,
   ProjectFile,
+  WorkspaceInfo,
 } from '../types'
 import { uid } from './utils'
 
@@ -21,6 +22,8 @@ export interface ToolEnv {
   searchChats(query: string): Array<{ title: string; snippet: string; updatedAt: number }>
   bridge?: {
     status: BridgeStatus
+    /** The root every call in this turn is aimed at. */
+    workspace: WorkspaceInfo
     call<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T>
     /** How much the model may change without asking; see `ApprovalMode`. */
     mode: ApprovalMode
@@ -399,14 +402,18 @@ const GITHUB_WRITE_TOOLS: ToolSpec[] = [
 ]
 
 /** The tool set for the current turn — project tools only inside a project. */
-export function harnessTools(hasProject: boolean, bridge?: BridgeStatus): ToolSpec[] {
+export function harnessTools(
+  hasProject: boolean,
+  bridge?: BridgeStatus,
+  workspace?: WorkspaceInfo,
+): ToolSpec[] {
   const tools = hasProject ? [...PROJECT_TOOLS, ...GLOBAL_TOOLS] : [...GLOBAL_TOOLS]
-  if (!bridge?.connected) return tools
+  if (!bridge?.connected || !workspace) return tools
   tools.push(...WORKSPACE_READ_TOOLS)
   if (bridge.capabilities.write) tools.push(...WORKSPACE_WRITE_TOOLS)
   if (bridge.capabilities.shell) tools.push(...SHELL_TOOLS)
-  if (bridge.github.available) tools.push(...GITHUB_TOOLS)
-  if (bridge.github.available && bridge.capabilities.githubWrite) tools.push(...GITHUB_WRITE_TOOLS)
+  if (workspace.github.available) tools.push(...GITHUB_TOOLS)
+  if (workspace.github.available && bridge.capabilities.githubWrite) tools.push(...GITHUB_WRITE_TOOLS)
   return tools
 }
 

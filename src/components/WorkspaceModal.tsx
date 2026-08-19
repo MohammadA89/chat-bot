@@ -224,26 +224,35 @@ export function WorkspaceModal({
 
 /** Live capability read-out for a connected sidecar. */
 function StatusBoard({ status }: { status: BridgeStatus }) {
-  const editors = (status.editors ?? []).filter((editor) => editor.cliAvailable || editor.workspaceMarker)
+  const editors = [...new Map(
+    status.workspaces
+      .flatMap((workspace) => workspace.editors ?? [])
+      .filter((editor) => editor.cliAvailable || editor.workspaceMarker)
+      .map((editor) => [editor.id, editor]),
+  ).values()]
+  const gitWorkspaces = status.workspaces.filter((workspace) => workspace.git.available)
+  const githubWorkspace = status.workspaces.find((workspace) => workspace.github.available)
 
   return (
     <div className="connection-summary">
-      <div>
+      {status.workspaces.map((workspace) => <div key={workspace.id}>
         <IconCheck />
-        <span><strong>{status.workspace.name}</strong><small dir="ltr">{status.workspace.root}</small></span>
-      </div>
+        <span><strong>{workspace.name}</strong><small dir="ltr">{workspace.root}</small></span>
+      </div>)}
       <div>
-        {status.git.available ? <IconGitBranch /> : <IconAlert />}
+        {gitWorkspaces.length ? <IconGitBranch /> : <IconAlert />}
         <span>
           <strong>Git</strong>
-          <small>{status.git.available ? status.git.branch : 'در دسترس نیست'}</small>
+          <small>{gitWorkspaces.length
+            ? `${gitWorkspaces.length} مخزن آماده`
+            : 'در دسترس نیست'}</small>
         </span>
       </div>
       <div>
-        {status.github.available ? <IconGithub /> : <IconAlert />}
+        {githubWorkspace ? <IconGithub /> : <IconAlert />}
         <span>
           <strong>GitHub</strong>
-          <small>{status.github.available ? `@${status.github.login}` : 'gh auth login لازم است'}</small>
+          <small>{githubWorkspace ? `@${githubWorkspace.github.login}` : 'gh auth login لازم است'}</small>
         </span>
       </div>
       <div>

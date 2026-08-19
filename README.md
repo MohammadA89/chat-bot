@@ -1,6 +1,6 @@
 <div align="center">
 
-# دستیار هوشمند · Persian Coding Agent
+# CodeBot · Persian Coding Agent
 
 **یک coding agent وب، کاملاً راست‌چین و local-first — که روی همان پروژه‌ای کار می‌کند که در VS Code یا Cursor باز کرده‌اید.**
 
@@ -11,11 +11,13 @@
 [![Node](https://img.shields.io/badge/Node-%E2%89%A520-5fa04e?logo=node.js&logoColor=white)](https://nodejs.org)
 [![Zero runtime deps](https://img.shields.io/badge/bridge-zero%20dependencies-34d399)](scripts/local-bridge.mjs)
 
+<img src="docs/images/codebot-overview.png" alt="نمای رابط فارسی و راست‌چین CodeBot" width="100%">
+
 </div>
 
 <div dir="rtl">
 
-به سرویس‌های سازگار با **OpenAI** یا **Anthropic** وصل می‌شود، از راه یک پل امن روی `127.0.0.1` فایل‌های واقعی پروژه‌تان را می‌خواند و می‌نویسد، `build` و `test` را اجرا می‌کند، و با نشست محلی `gh` به GitHub وصل می‌شود. هیچ کلید و هیچ فایلی به سرور ما نمی‌رود — چون اصلاً سروری وجود ندارد.
+**CodeBot** به سرویس‌های سازگار با **OpenAI** یا **Anthropic** وصل می‌شود، از راه یک پل امن روی `127.0.0.1` فایل‌های واقعی پروژه‌تان را می‌خواند و می‌نویسد، `build` و `test` را اجرا می‌کند، و با نشست محلی `gh` به GitHub وصل می‌شود. هیچ کلید و هیچ فایلی به سرور ما نمی‌رود — چون اصلاً سروری وجود ندارد.
 
 ## فهرست
 
@@ -59,8 +61,8 @@
 </div>
 
 ```bash
-git clone https://github.com/MohammadA89/chat-bot.git
-cd chat-bot
+git clone https://github.com/MohammadA89/CodeBot.git
+cd CodeBot
 npm install
 npm run dev
 ```
@@ -318,6 +320,6 @@ Issue و Pull Request خوش‌آمد است. پیش از ارسال:
 
 <div align="center">
 
-**English:** A local-first, fully RTL Persian coding agent for the browser. It talks to any OpenAI- or Anthropic-compatible endpoint and reaches your real project through a zero-dependency localhost bridge — path-jailed file access, git, a live terminal, and the GitHub CLI — with every mutation gated behind a diff-level approval prompt. See [AGENTS.md](AGENTS.md) for the architecture notes.
+**English:** CodeBot is a local-first, fully RTL Persian coding agent for the browser. It talks to any OpenAI- or Anthropic-compatible endpoint and reaches your real project through a zero-dependency localhost bridge — path-jailed file access, git, a live terminal, and the GitHub CLI — with every mutation gated behind a diff-level approval prompt. See [AGENTS.md](AGENTS.md) for the architecture notes.
 
 </div>

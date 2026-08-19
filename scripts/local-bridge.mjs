@@ -2,12 +2,13 @@
 /**
  * Local workspace bridge.
  *
- * A dependency-free HTTP sidecar that exposes exactly one folder — the one the
+ * A dependency-free HTTP sidecar that exposes one or more folders — the ones the
  * user has open in VS Code or Cursor — to the browser client over localhost.
- * Everything is path-jailed to that root, every request carries a bearer token,
- * and mutating capabilities stay off until they are explicitly enabled.
+ * Every request is path-jailed to the root it names, carries a bearer token, and
+ * mutating capabilities stay off until they are explicitly enabled. The
+ * capability flags apply to every root: one session, one level of trust.
  *
- *   node scripts/local-bridge.mjs --workspace "D:\repo" --allow-write --allow-shell
+ *   node scripts/local-bridge.mjs --workspace "D:\repo" --workspace "D:\api" --allow-write
  */
 import { createServer } from 'node:http'
 import { randomBytes, randomUUID } from 'node:crypto'
@@ -53,9 +54,16 @@ function parseArgs(argv) {
     const index = argv.indexOf(name)
     return index >= 0 && argv[index + 1] && !argv[index + 1].startsWith('--') ? argv[index + 1] : fallback
   }
+  // `--workspace` is repeatable: every occurrence adds another root.
+  const folders = []
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] !== '--workspace') continue
+    const next = argv[i + 1]
+    if (next && !next.startsWith('--')) folders.push(resolve(next))
+  }
   const all = argv.includes('--allow-all')
   return {
-    workspace: resolve(value('--workspace', process.cwd())),
+    workspaces: folders.length ? folders : [resolve(process.cwd())],
     port: Number(value('--port', process.env.BRIDGE_PORT ?? DEFAULT_PORT)),
     token: value('--token', process.env.BRIDGE_TOKEN ?? randomBytes(24).toString('base64url')),
     allowWrite: all || argv.includes('--allow-write'),
@@ -63,6 +71,55 @@ function parseArgs(argv) {
     allowGithubWrite: all || argv.includes('--allow-github-write'),
     selfTest: argv.includes('--self-test'),
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              workspace registry                             */
+/* -------------------------------------------------------------------------- */
+
+/** A URL/JSON-safe id derived from the folder name, e.g. `chat-bot`. */
+function slugify(name) {
+  const slug = String(name).toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '')
+  return slug || 'workspace'
+}
+
+/**
+ * Turns the resolved `--workspace` folders into `{ id, name, root }` records.
+ * Duplicate names get a numeric suffix so ids stay unique and stable across
+ * restarts as long as the folder set is the same.
+ */
+async function buildWorkspaces(folders) {
+  const seen = new Map()
+  const list = []
+
+  for (const folder of folders) {
+    const root = await realpath(folder)
+    if (!(await stat(root)).isDirectory()) throw new Error(`Workspace must be a directory: ${folder}`)
+    if (list.some((item) => item.root === root)) continue
+
+    const name = basename(root) || root
+    const base = slugify(name)
+    const count = (seen.get(base) ?? 0) + 1
+    seen.set(base, count)
+    list.push({ id: count === 1 ? base : `${base}-${count}`, name, root })
+  }
+
+  if (!list.length) throw new Error('No workspace folder was resolved.')
+  return list
+}
+
+/**
+ * Picks the root a request is talking about. `params.workspace` may be an id or
+ * an absolute path; when it is missing the first workspace is used, which keeps
+ * single-root callers working unchanged.
+ */
+function resolveWorkspace(workspaces, requested) {
+  if (requested === undefined || requested === null || requested === '') return workspaces[0]
+  const wanted = String(requested)
+  const match = workspaces.find((item) => item.id === wanted)
+    || workspaces.find((item) => item.root === resolve(wanted))
+  if (!match) throw new Error(`Workspace شناخته‌شده نیست: ${wanted}`)
+  return match
 }
 
 /* -------------------------------------------------------------------------- */
@@ -266,19 +323,22 @@ const EDITORS = [
   { id: 'windsurf', name: 'Windsurf', cli: 'windsurf', marker: '.windsurf' },
 ]
 
-let editorCache = null
+/** Per-root, because `workspaceMarker` (`.vscode`, `.cursor`…) is per-root. */
+const editorCache = new Map()
 
 async function detectEditors(root) {
-  if (editorCache) return editorCache
+  const cached = editorCache.get(root)
+  if (cached) return cached
   const probe = process.platform === 'win32' ? 'where' : 'which'
-  editorCache = await Promise.all(EDITORS.map(async (editor) => {
+  const detected = await Promise.all(EDITORS.map(async (editor) => {
     const [cliAvailable, workspaceMarker] = await Promise.all([
       runFile(probe, [editor.cli], root, 6_000).then((result) => result.ok),
       stat(join(root, editor.marker)).then(() => true).catch(() => false),
     ])
     return { id: editor.id, name: editor.name, cli: editor.cli, cliAvailable, workspaceMarker }
   }))
-  return editorCache
+  editorCache.set(root, detected)
+  return detected
 }
 
 /* -------------------------------------------------------------------------- */
@@ -297,7 +357,24 @@ function redactRemote(remote) {
   }
 }
 
-async function healthStatus(root, options) {
+/**
+ * Probing git, gh and the editor CLIs costs several `execFile` calls per root,
+ * and `/health` is polled. A few seconds of cache keeps a multi-root probe as
+ * cheap as a single-root one without ever showing a stale branch for long.
+ */
+const STATUS_TTL = 5_000
+const statusCache = new Map()
+
+async function workspaceStatus(workspace) {
+  const cached = statusCache.get(workspace.root)
+  if (cached && Date.now() - cached.at < STATUS_TTL) return cached.value
+
+  const value = await probeWorkspace(workspace)
+  statusCache.set(workspace.root, { at: Date.now(), value })
+  return value
+}
+
+async function probeWorkspace({ id, name, root }) {
   const [branchResult, editors, githubResult] = await Promise.all([
     runFile('git', ['branch', '--show-current'], root, 5_000),
     detectEditors(root),
@@ -316,10 +393,9 @@ async function healthStatus(root, options) {
     : []
 
   return {
-    connected: true,
-    version: VERSION,
-    platform: process.platform,
-    workspace: { name: basename(root), root },
+    id,
+    name,
+    root,
     editors,
     git: {
       available: branchResult.ok,
@@ -330,12 +406,29 @@ async function healthStatus(root, options) {
       available: githubResult.ok,
       ...(githubResult.ok ? { login: githubResult.stdout.trim() } : {}),
     },
+  }
+}
+
+/**
+ * Connection-level status. `workspaces` describes every root; `workspace` is the
+ * one this particular call resolved to, so `system.health` still answers "where
+ * am I" for whoever asked.
+ */
+async function healthStatus(workspaces, resolved, options) {
+  const list = await Promise.all(workspaces.map(workspaceStatus))
+
+  return {
+    connected: true,
+    version: VERSION,
+    platform: process.platform,
+    workspaces: list,
+    workspace: list.find((item) => item.id === resolved.id) ?? list[0],
     capabilities: {
       read: true,
       write: options.allowWrite,
       shell: options.allowShell,
       githubWrite: options.allowGithubWrite,
-      watch: watcherActive,
+      watch: watchers.size > 0,
     },
   }
 }
@@ -733,6 +826,7 @@ const jobs = new Map()
 function jobSummary(job) {
   return {
     id: job.id,
+    workspace: job.workspace,
     command: job.command,
     cwd: job.cwd,
     running: job.running,
@@ -743,12 +837,12 @@ function jobSummary(job) {
   }
 }
 
-function startJob(root, command, cwd, emit) {
+function startJob(workspace, command, cwd, emit) {
   const [file, args] = shellArgs(command)
   const id = randomUUID()
   const child = spawn(file, args, { cwd, windowsHide: true })
   const job = {
-    id, command, cwd: toRel(root, cwd), child, output: '',
+    id, workspace: workspace.id, command, cwd: toRel(workspace.root, cwd), child, output: '',
     running: true, exitCode: null, startedAt: Date.now(), endedAt: null,
   }
   jobs.set(id, job)
@@ -756,7 +850,7 @@ function startJob(root, command, cwd, emit) {
   const append = (chunk) => {
     const text = chunk.toString('utf8')
     job.output = (job.output + text).slice(-MAX_JOB_BUFFER)
-    emit('job.output', { id, chunk: text.slice(0, 8_000) })
+    emit('job.output', { workspace: job.workspace, id, chunk: text.slice(0, 8_000) })
   }
   child.stdout?.on('data', append)
   child.stderr?.on('data', append)
@@ -870,7 +964,9 @@ async function githubHandler(method, params, root, options) {
 /* -------------------------------------------------------------------------- */
 
 async function handleRpc(method, params, ctx) {
-  const { root, options, emit } = ctx
+  const { workspaces, options, emit } = ctx
+  const workspace = resolveWorkspace(workspaces, params.workspace)
+  const root = workspace.root
 
   if (method.startsWith('git.')) return gitHandler(method, params, root, options)
   if (method.startsWith('github.') && method !== 'github.status') return githubHandler(method, params, root, options)
@@ -878,7 +974,7 @@ async function handleRpc(method, params, ctx) {
   switch (method) {
     case 'system.health':
     case 'github.status':
-      return healthStatus(root, options)
+      return healthStatus(workspaces, workspace, options)
 
     case 'workspace.children':
       return listChildren(root, params.path ?? '.')
@@ -959,7 +1055,7 @@ async function handleRpc(method, params, ctx) {
       if (!command || command.length > 4000) throw new Error('دستور ترمینال معتبر نیست.')
       const cwd = await confinedPath(root, params.cwd ?? '.')
       if (!(await stat(cwd)).isDirectory()) throw new Error('cwd باید یک پوشه باشد.')
-      return startJob(root, command, cwd, emit)
+      return startJob(workspace, command, cwd, emit)
     }
 
     case 'shell.poll':
@@ -967,7 +1063,12 @@ async function handleRpc(method, params, ctx) {
     case 'shell.kill':
       return killJob(params.id)
     case 'shell.jobs':
-      return { jobs: [...jobs.values()].map(jobSummary).sort((a, b) => b.startedAt - a.startedAt) }
+      return {
+        jobs: [...jobs.values()]
+          .filter((job) => params.workspace === undefined || job.workspace === workspace.id)
+          .map(jobSummary)
+          .sort((a, b) => b.startedAt - a.startedAt),
+      }
 
     default:
       throw new Error(`متد ناشناخته است: ${method}`)
@@ -979,7 +1080,8 @@ async function handleRpc(method, params, ctx) {
 /* -------------------------------------------------------------------------- */
 
 const clients = new Set()
-let watcherActive = false
+/** Ids of the roots with a live recursive watcher. */
+const watchers = new Set()
 
 function emit(type, payload) {
   if (clients.size === 0) return
@@ -987,23 +1089,25 @@ function emit(type, payload) {
   for (const client of clients) client.write(frame)
 }
 
-function startWatcher(root) {
+function startWatcher(workspace) {
   try {
     const pending = new Map()
-    const watcher = watch(root, { recursive: true, persistent: false }, (_event, filename) => {
+    const watcher = watch(workspace.root, { recursive: true, persistent: false }, (_event, filename) => {
       if (!filename) return
       const rel = String(filename).replaceAll('\\', '/')
       if (rel.split('/').some((part) => IGNORED.has(part))) return
       clearTimeout(pending.get(rel))
       pending.set(rel, setTimeout(() => {
         pending.delete(rel)
-        emit('fs.change', { path: rel })
+        // Fresh status next probe: a change may well be a branch switch.
+        statusCache.delete(workspace.root)
+        emit('fs.change', { workspace: workspace.id, path: rel })
       }, 220))
     })
-    watcher.on('error', () => { watcherActive = false })
-    watcherActive = true
+    watcher.on('error', () => { watchers.delete(workspace.id) })
+    watchers.add(workspace.id)
   } catch {
-    watcherActive = false
+    watchers.delete(workspace.id)
   }
 }
 
@@ -1075,7 +1179,36 @@ async function selfTest() {
     await deletePath(root, 'nested')
     check(!(await stat(join(root, 'nested')).catch(() => null)), 'delete failed')
 
-    console.log('Bridge self-test passed: path jail, diffs, glob, search, and mutations are working.')
+    // --- multi-root routing ---------------------------------------------- //
+    await mkdir(join(root, 'alpha'), { recursive: true })
+    await mkdir(join(root, 'beta'), { recursive: true })
+    await writeFile(join(root, 'alpha', 'who.txt'), 'alpha', 'utf8')
+    await writeFile(join(root, 'beta', 'who.txt'), 'beta', 'utf8')
+
+    const roots = await buildWorkspaces([join(root, 'alpha'), join(root, 'beta')])
+    check(roots.length === 2, 'buildWorkspaces dropped a root')
+    check(roots[0].id === 'alpha' && roots[1].id === 'beta', 'workspace ids are wrong')
+    check((await buildWorkspaces([join(root, 'alpha'), join(root, 'alpha')])).length === 1, 'duplicate root was kept')
+
+    check(resolveWorkspace(roots, undefined).id === 'alpha', 'missing workspace did not fall back to the first')
+    check(resolveWorkspace(roots, 'beta').id === 'beta', 'resolve by id failed')
+    check(resolveWorkspace(roots, roots[1].root).id === 'beta', 'resolve by path failed')
+
+    let unknownRejected = false
+    try { resolveWorkspace(roots, 'gamma') } catch { unknownRejected = true }
+    check(unknownRejected, 'an unknown workspace was accepted')
+
+    check((await readTextFile(roots[0].root, 'who.txt')).content === 'alpha', 'root A read the wrong file')
+    check((await readTextFile(roots[1].root, 'who.txt')).content === 'beta', 'root B read the wrong file')
+
+    let crossRejected = false
+    try { await confinedPath(roots[0].root, '../beta/who.txt') } catch { crossRejected = true }
+    check(crossRejected, 'traversal from one root into another was not rejected')
+
+    await rm(join(root, 'alpha'), { recursive: true, force: true })
+    await rm(join(root, 'beta'), { recursive: true, force: true })
+
+    console.log('Bridge self-test passed: path jail, diffs, glob, search, mutations, and multi-root routing are working.')
   } finally {
     await rm(folder, { recursive: true, force: true })
   }
@@ -1094,9 +1227,8 @@ if (options.selfTest) {
 if (!Number.isInteger(options.port) || options.port < 1024 || options.port > 65535) {
   throw new Error('Bridge port must be an integer between 1024 and 65535.')
 }
-const root = await realpath(options.workspace)
-if (!(await stat(root)).isDirectory()) throw new Error('Workspace must be a directory.')
-startWatcher(root)
+const workspaces = await buildWorkspaces(options.workspaces)
+for (const workspace of workspaces) startWatcher(workspace)
 
 const server = createServer(async (req, res) => {
   if (req.method === 'OPTIONS') {
@@ -1110,8 +1242,10 @@ const server = createServer(async (req, res) => {
   }
 
   try {
-    if (req.method === 'GET' && req.url === '/health') {
-      return json(req, res, 200, { ok: true, result: await healthStatus(root, options) })
+    if (req.method === 'GET' && req.url?.startsWith('/health')) {
+      const requested = new URL(req.url, 'http://127.0.0.1').searchParams.get('workspace')
+      const resolved = resolveWorkspace(workspaces, requested)
+      return json(req, res, 200, { ok: true, result: await healthStatus(workspaces, resolved, options) })
     }
 
     if (req.method === 'GET' && req.url === '/events') {
@@ -1135,7 +1269,7 @@ const server = createServer(async (req, res) => {
       const request = await readBody(req)
       if (typeof request.method !== 'string') throw new Error('نام متد الزامی است.')
       const params = request.params && typeof request.params === 'object' ? request.params : {}
-      const result = await handleRpc(request.method, params, { root, options, emit })
+      const result = await handleRpc(request.method, params, { workspaces, options, emit })
       return json(req, res, 200, { ok: true, result })
     }
 
@@ -1151,7 +1285,10 @@ server.listen(options.port, '127.0.0.1', () => {
   if (options.allowShell) caps.push('shell')
   if (options.allowGithubWrite) caps.push('github-write')
   console.log(`Local bridge v${VERSION}: http://127.0.0.1:${options.port}`)
-  console.log(`Workspace:    ${root}`)
+  console.log(`Workspaces:   ${workspaces.length}`)
+  for (const workspace of workspaces) {
+    console.log(`  ${workspace.id.padEnd(20)} ${workspace.root}${watchers.has(workspace.id) ? '' : '  (no watch)'}`)
+  }
   console.log(`Token:        ${options.token}`)
-  console.log(`Capabilities: ${caps.join(', ')}${watcherActive ? ' + live file watch' : ''}`)
+  console.log(`Capabilities: ${caps.join(', ')} — shared by every workspace`)
 })

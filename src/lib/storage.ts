@@ -15,6 +15,7 @@ const KEYS = {
   settings: 'chatbot.settings',
   activeId: 'chatbot.activeId',
   activeProjectId: 'chatbot.activeProjectId',
+  activeWorkspaceId: 'chatbot.activeWorkspaceId',
   layout: 'chatbot.layout',
 } as const
 
@@ -85,6 +86,8 @@ function migrateProject(p: Project): Project {
     instructions: p.instructions ?? '',
     facts: p.facts ?? [],
     files: p.files ?? [],
+    workspaceRoot: p.workspaceRoot ?? null,
+    workspaceId: p.workspaceId ?? null,
   }
 }
 
@@ -112,6 +115,9 @@ export const storage = {
 
   loadActiveProjectId: (): string | null => read<string | null>(KEYS.activeProjectId, null),
   saveActiveProjectId: (id: string | null): void => void write(KEYS.activeProjectId, id),
+
+  loadActiveWorkspaceId: (): string | null => read<string | null>(KEYS.activeWorkspaceId, null),
+  saveActiveWorkspaceId: (id: string | null): void => void write(KEYS.activeWorkspaceId, id),
 
   loadLayout: (): Layout => ({ ...DEFAULT_LAYOUT, ...read<Partial<Layout>>(KEYS.layout, {}) }),
   saveLayout: (layout: Layout): void => void write(KEYS.layout, layout),

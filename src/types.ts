@@ -33,14 +33,26 @@ export interface EditorInfo {
   workspaceMarker: boolean
 }
 
+/** One folder the sidecar was launched against. Ids are stable per session. */
+export interface WorkspaceInfo {
+  id: string
+  name: string
+  root: string
+  editors?: EditorInfo[]
+  git: { available: boolean; branch?: string; remote?: string; ahead?: number; behind?: number }
+  github: { available: boolean; login?: string }
+}
+
+/**
+ * Connection-level state. Capabilities are granted by the launch flags and are
+ * therefore shared by every root; everything folder-specific lives on
+ * `WorkspaceInfo`.
+ */
 export interface BridgeStatus {
   connected: boolean
   version?: string
   platform?: string
-  workspace: { name: string; root: string }
-  editors?: EditorInfo[]
-  git: { available: boolean; branch?: string; remote?: string; ahead?: number; behind?: number }
-  github: { available: boolean; login?: string }
+  workspaces: WorkspaceInfo[]
   capabilities: BridgeCapabilities
 }
 
@@ -93,6 +105,8 @@ export interface GitCommit {
 
 export interface ShellJob {
   id: string
+  /** Id of the workspace the command runs in. */
+  workspace?: string
   command: string
   cwd: string
   running: boolean
@@ -116,11 +130,14 @@ export interface EditResult {
   removed: number
 }
 
-/** A live event pushed from the sidecar over `/events`. */
+/**
+ * A live event pushed from the sidecar over `/events`. One stream carries every
+ * workspace, so consumers filter on `payload.workspace`.
+ */
 export type BridgeEvent =
   | { type: 'ready'; payload: { version: string }; at: number }
-  | { type: 'fs.change'; payload: { path: string }; at: number }
-  | { type: 'job.output'; payload: { id: string; chunk: string }; at: number }
+  | { type: 'fs.change'; payload: { workspace?: string; path: string }; at: number }
+  | { type: 'job.output'; payload: { workspace?: string; id: string; chunk: string }; at: number }
   | { type: 'job.end'; payload: ShellJob; at: number }
 
 /* ------------------------------- approvals -------------------------------- */
@@ -244,6 +261,13 @@ export interface Project {
   instructions: string
   facts: ProjectFact[]
   files: ProjectFile[]
+  /**
+   * Absolute path of the real folder this project codes in — the durable link,
+   * since bridge ids only exist for the lifetime of a sidecar session.
+   */
+  workspaceRoot?: string | null
+  /** Last id that `workspaceRoot` resolved to; a hint, never the source of truth. */
+  workspaceId?: string | null
   createdAt: number
   updatedAt: number
 }
