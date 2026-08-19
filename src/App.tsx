@@ -13,7 +13,7 @@ import type {
   Settings,
 } from './types'
 import { ApiError, listModels } from './lib/api'
-import { callBridge, probeBridge, subscribeBridgeEvents } from './lib/bridge'
+import { callBridge, probeBridge, resolveWorkspace, subscribeBridgeEvents } from './lib/bridge'
 import { extractFacts, runTurn } from './lib/harness'
 import { storage } from './lib/storage'
 import { addFacts } from './lib/tools'
@@ -52,6 +52,8 @@ export default function App() {
   const [projects, setProjects] = useState<Project[]>(() => storage.loadProjects())
   const [activeId, setActiveId] = useState<string | null>(() => storage.loadActiveId())
   const [activeProjectId, setActiveProjectId] = useState<string | null>(() => storage.loadActiveProjectId())
+  /** Manual workspace pick, used only when the open project has no folder. */
+  const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(() => storage.loadActiveWorkspaceId())
   const [settings, setSettings] = useState<Settings>(() => storage.loadSettings())
   const [model, setModel] = useState('')
   const [input, setInput] = useState('')
@@ -85,6 +87,17 @@ export default function App() {
     () => projects.find((project) => project.id === (active?.projectId ?? activeProjectId)) ?? null,
     [projects, active?.projectId, activeProjectId],
   )
+  /**
+   * The folder this conversation codes in. A project pinned to a folder wins, so
+   * opening a project retargets the panel and every tool call at once; without
+   * one, the user's manual pick decides.
+   */
+  const activeWorkspace = useMemo(
+    () => resolveWorkspace(bridgeStatus, activeProject, activeWorkspaceId),
+    [bridgeStatus, activeProject, activeWorkspaceId],
+  )
+  /** Set when the open project points at a folder this bridge is not serving. */
+  const missingWorkspace = Boolean(bridgeStatus && activeProject?.workspaceRoot && !activeWorkspace)
 
   useEffect(() => {
     const timer = setTimeout(() => storage.saveConversations(conversations), 300)
@@ -96,6 +109,7 @@ export default function App() {
   }, [projects])
   useEffect(() => storage.saveActiveId(activeId), [activeId])
   useEffect(() => storage.saveActiveProjectId(activeProjectId), [activeProjectId])
+  useEffect(() => storage.saveActiveWorkspaceId(activeWorkspaceId), [activeWorkspaceId])
   useEffect(() => storage.saveLayout(layout), [layout])
   useEffect(() => storage.saveSettings(settings), [settings])
   useEffect(() => document.documentElement.setAttribute('data-theme', settings.theme), [settings.theme])
@@ -133,7 +147,7 @@ export default function App() {
       window.clearTimeout(retry)
       unsubscribe()
     }
-  }, [bridgeConfig, bridgeStatus?.workspace.root]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [bridgeConfig, bridgeStatus?.workspaces.length]) // eslint-disable-line react-hooks/exhaustive-deps
 
   /**
    * Shows the permission dialog and resolves once the user decides. `always`
@@ -314,15 +328,21 @@ export default function App() {
               updatedAt: conversation.updatedAt,
             }))
           },
-          ...(bridgeConfig && bridgeStatus ? {
+          ...(bridgeConfig && bridgeStatus && activeWorkspace ? {
             bridge: {
               status: bridgeStatus,
+              workspace: activeWorkspace,
               mode: settings.approvalMode,
               approve: requestApproval,
+              // Every tool call is pinned to this turn's workspace here, so no
+              // individual tool can reach into another project's folder.
               call: <T,>(method: string, params: Record<string, unknown> = {}) =>
-                callBridge<T>(bridgeConfig, method, params, controller.signal),
-              onWorkspaceChange: (path?: string) =>
-                setBridgeEvent({ type: 'fs.change', payload: { path: path ?? '.' }, at: Date.now() }),
+                callBridge<T>(bridgeConfig, method, { ...params, workspace: activeWorkspace.id }, controller.signal),
+              onWorkspaceChange: (path?: string) => setBridgeEvent({
+                type: 'fs.change',
+                payload: { workspace: activeWorkspace.id, path: path ?? '.' },
+                at: Date.now(),
+              }),
             },
           } : {}),
         },
@@ -384,7 +404,7 @@ export default function App() {
       abortRef.current = null
       setStreaming(false)
     }
-  }, [bridgeConfig, bridgeStatus, config, conversations, model, patchConversation, projects, requestApproval, settings, toast])
+  }, [activeWorkspace, bridgeConfig, bridgeStatus, config, conversations, model, patchConversation, projects, requestApproval, settings, toast])
 
   const send = useCallback(async () => {
     const text = input.trim()
@@ -500,10 +520,31 @@ export default function App() {
               <IconPanel />
             </button>
           )}
-          <button className={`workspace-pill${bridgeStatus ? ' connected' : ''}`} onClick={() => setShowWorkspace(true)} title="اتصال Workspace، Git و GitHub">
-            <span className="status-dot" /><IconCode size={15} /><span>{bridgeStatus?.workspace.name ?? 'اتصال Workspace'}</span>
-            {bridgeStatus?.git.branch && <small><IconGitBranch size={11} />{bridgeStatus.git.branch}</small>}
+          <button
+            className={`workspace-pill${activeWorkspace ? ' connected' : ''}${missingWorkspace ? ' missing' : ''}`}
+            onClick={() => setShowWorkspace(true)}
+            title={missingWorkspace
+              ? `پوشه‌ی پروژه در دسترس نیست: ${activeProject?.workspaceRoot}`
+              : activeWorkspace?.root ?? 'اتصال Workspace، Git و GitHub'}
+          >
+            <span className="status-dot" /><IconCode size={15} />
+            <span>{missingWorkspace ? 'پوشه در دسترس نیست' : activeWorkspace?.name ?? 'اتصال Workspace'}</span>
+            {activeWorkspace?.git.branch && <small><IconGitBranch size={11} />{activeWorkspace.git.branch}</small>}
           </button>
+          {/* Switching is a manual override, so it is hidden once a project pins the folder. */}
+          {!activeProject?.workspaceRoot && (bridgeStatus?.workspaces.length ?? 0) > 1 && (
+            <select
+              className="workspace-switch"
+              value={activeWorkspace?.id ?? ''}
+              onChange={(event) => setActiveWorkspaceId(event.target.value)}
+              aria-label="انتخاب Workspace"
+              title="جابه‌جایی بین پوشه‌های متصل"
+            >
+              {bridgeStatus?.workspaces.map((workspace) => (
+                <option key={workspace.id} value={workspace.id}>{workspace.name}</option>
+              ))}
+            </select>
+          )}
           <ModelPicker models={models} value={model} loading={modelsLoading} onChange={selectModel} onRefresh={() => refreshModels(config)} />
         </header>
 
@@ -535,7 +576,7 @@ export default function App() {
         </div>
       </main>
 
-      {bridgeConfig && bridgeStatus && settings.workspacePanel && !mobile && (
+      {bridgeConfig && bridgeStatus && activeWorkspace && settings.workspacePanel && !mobile && (
         <>
           <ResizeHandle
             anchor="end"
@@ -546,8 +587,10 @@ export default function App() {
             onResize={(panelWidth) => setLayout((value) => ({ ...value, panelWidth }))}
           />
           <WorkspacePanel
+            key={activeWorkspace.id}
             config={bridgeConfig}
             status={bridgeStatus}
+            workspace={activeWorkspace}
             width={layout.panelWidth}
             event={bridgeEvent}
             onClose={() => setSettings((value) => ({ ...value, workspacePanel: false }))}
@@ -563,8 +606,13 @@ export default function App() {
         onApprovalModeChange={(mode) => setSettings((value) => ({ ...value, approvalMode: mode }))}
         onConnected={(nextConfig, status) => {
           storage.saveBridgeConfig(nextConfig); setBridgeConfig(nextConfig); setBridgeStatus(status); setShowWorkspace(false)
+          setActiveWorkspaceId((current) => status.workspaces.some((workspace) => workspace.id === current)
+            ? current
+            : status.workspaces[0]?.id ?? null)
           setSettings((value) => ({ ...value, workspacePanel: true }))
-          toast(`Workspace «${status.workspace.name}» متصل شد`, 'success')
+          toast(status.workspaces.length === 1
+            ? `Workspace «${status.workspaces[0]?.name ?? 'بدون نام'}» متصل شد`
+            : `${toFa(status.workspaces.length)} Workspace متصل شدند`, 'success')
         }}
         onDisconnect={() => {
           storage.clearBridgeConfig(); setBridgeConfig(null); setBridgeStatus(null); setShowWorkspace(false)

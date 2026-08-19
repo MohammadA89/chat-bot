@@ -18,6 +18,7 @@ import type {
   Settings,
   ToolRun,
   Usage,
+  WorkspaceInfo,
 } from '../types'
 import type { ThinkChunk } from './thinking'
 import { uid } from './utils'
@@ -79,21 +80,36 @@ function projectSection(project: Project): string {
  * Describes the real machine to the model: what it may touch, which editor is
  * on the other side, and how it is expected to work through a change.
  */
-function workspaceSection(bridge: BridgeStatus, mode: ApprovalMode): string {
-  const editors = (bridge.editors ?? []).filter((editor) => editor.cliAvailable || editor.workspaceMarker)
+function workspaceSection(
+  bridge: BridgeStatus,
+  workspace: WorkspaceInfo,
+  mode: ApprovalMode,
+  tree?: string,
+): string {
+  const editors = (workspace.editors ?? []).filter((editor) => editor.cliAvailable || editor.workspaceMarker)
   const editorNames = editors.length ? editors.map((editor) => editor.name).join(' و ') : 'VS Code یا Cursor'
 
   const lines = [
     '# محیط برنامه‌نویسی واقعی',
-    `Workspace «${bridge.workspace.name}» در مسیر ${bridge.workspace.root} همین حالا در ${editorNames} کاربر باز است.`,
+    `Workspace «${workspace.name}» در مسیر ${workspace.root} همین حالا در ${editorNames} کاربر باز است.`,
     'ابزارهای workspace مستقیماً روی همین فایل‌ها کار می‌کنند؛ هر تغییری بلافاصله در ادیتور کاربر دیده می‌شود.',
-    bridge.git.available
-      ? `Git فعال است؛ شاخه‌ی جاری ${bridge.git.branch ?? 'نامشخص'}${bridge.git.ahead ? ` (${bridge.git.ahead} commit جلوتر)` : ''}.`
+    workspace.git.available
+      ? `Git فعال است؛ شاخه‌ی جاری ${workspace.git.branch ?? 'نامشخص'}${workspace.git.ahead ? ` (${workspace.git.ahead} commit جلوتر)` : ''}.`
       : 'این پوشه مخزن Git نیست، پس ابزارهای git کار نمی‌کنند.',
-    bridge.github.available
-      ? `GitHub با حساب ${bridge.github.login} متصل است.`
+    workspace.github.available
+      ? `GitHub با حساب ${workspace.github.login} متصل است.`
       : 'GitHub متصل نیست؛ درباره‌ی Issue و PR حدس نزن.',
   ]
+
+  if (tree) {
+    lines.push(
+      '',
+      '## ساختار پوشه',
+      'نمای کوتاهی از ریشه‌ی پروژه است، نه فهرست کامل؛ پوشه‌های عمیق‌تر و فایل‌های بیشتری هم وجود دارند.',
+      'محتوای هیچ فایلی اینجا نیامده — برای دیدن کد حتماً workspace_read را صدا بزن.',
+      tree,
+    )
+  }
 
   lines.push(
     '',
@@ -130,6 +146,33 @@ function workspaceSection(bridge: BridgeStatus, mode: ApprovalMode): string {
   return lines.join('\n')
 }
 
+/** How many workspace paths the folder map may list before it is cut short. */
+const TREE_ENTRY_LIMIT = 120
+
+/**
+ * A shallow map of the workspace, fetched once per turn so the model opens on
+ * something real instead of guessing at paths. Best-effort: a bridge that is
+ * gone or slow just means no map, never a failed turn.
+ */
+async function fetchWorkspaceTree(env: ToolEnv): Promise<string | undefined> {
+  if (!env.bridge) return undefined
+
+  try {
+    const { entries } = await env.bridge.call<{ entries: Array<{ path: string; type: string }> }>(
+      'workspace.list',
+      { path: '.', depth: 2 },
+    )
+    if (!entries.length) return undefined
+
+    const shown = entries.slice(0, TREE_ENTRY_LIMIT)
+    const lines = shown.map((entry) => `${entry.path}${entry.type === 'directory' ? '/' : ''}`)
+    if (entries.length > shown.length) lines.push(`… و ${entries.length - shown.length} مورد دیگر`)
+    return lines.join('\n')
+  } catch {
+    return undefined
+  }
+}
+
 export interface PromptContext {
   settings: Settings
   project: Project | null
@@ -137,6 +180,10 @@ export interface PromptContext {
   model: string
   toolsEnabled: boolean
   bridge?: BridgeStatus
+  /** The root this turn is aimed at; without one the workspace section is skipped. */
+  workspace?: WorkspaceInfo | null
+  /** Shallow folder listing, so the model starts with a map instead of guesses. */
+  workspaceTree?: string
   approvalMode?: ApprovalMode
 }
 
@@ -158,7 +205,9 @@ export function buildSystemPrompt(ctx: PromptContext): string {
     )
   }
 
-  if (ctx.bridge?.connected) parts.push(workspaceSection(ctx.bridge, ctx.approvalMode ?? 'ask'))
+  if (ctx.bridge?.connected && ctx.workspace) {
+    parts.push(workspaceSection(ctx.bridge, ctx.workspace, ctx.approvalMode ?? 'ask', ctx.workspaceTree))
+  }
 
   if (ctx.project) parts.push(projectSection(ctx.project))
 
@@ -277,6 +326,7 @@ export async function runTurn(req: TurnRequest): Promise<TurnResult> {
   const { config, model, settings, project, history, signal, env } = req
 
   let summary = req.conversation.summary
+  const workspaceTree = await fetchWorkspaceTree(env)
   const systemPrompt = () =>
     buildSystemPrompt({
       settings,
@@ -285,6 +335,8 @@ export async function runTurn(req: TurnRequest): Promise<TurnResult> {
       model,
       toolsEnabled: settings.toolsEnabled,
       bridge: env.bridge?.status,
+      workspace: env.bridge?.workspace,
+      workspaceTree,
       approvalMode: env.bridge?.mode,
     })
 
@@ -303,7 +355,9 @@ export async function runTurn(req: TurnRequest): Promise<TurnResult> {
     }
   }
 
-  const tools = settings.toolsEnabled ? harnessTools(Boolean(project), env.bridge?.status) : undefined
+  const tools = settings.toolsEnabled
+    ? harnessTools(Boolean(project), env.bridge?.status, env.bridge?.workspace)
+    : undefined
   const wire: WireMessage[] = [...plan.wire]
   const toolRuns: ToolRun[] = []
   let usage: Usage | undefined

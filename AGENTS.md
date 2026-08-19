@@ -21,7 +21,8 @@ Local-first Persian web coding agent. The React client talks to an OpenAI- or An
 ## Architecture decisions
 
 - The web UI never accesses the filesystem directly; it calls the bridge RPC endpoint.
-- The bridge binds to `127.0.0.1`, requires a bearer token, validates every path against one workspace root, and caps body/output sizes.
+- The bridge binds to `127.0.0.1`, requires a bearer token, validates every path against its selected workspace root, and caps body/output sizes.
+- One bridge process may expose multiple explicitly allowlisted roots. Every RPC and model tool call is pinned to the active workspace ID; projects may pin a durable absolute root.
 - Read access is available after authentication. File writes, terminal commands, and GitHub mutations require separate launch flags.
 - Every mutating tool call passes an approval gate in the client: `plan` blocks it, `ask` shows the exact diff or command for confirmation, `auto` lets it through.
 - The model only receives tools reported as available by the connected bridge.
@@ -54,7 +55,7 @@ Local-first Persian web coding agent. The React client talks to an OpenAI- or An
 
 - `POST /rpc` accepts `{ "method": string, "params": object }`.
 - Success is `{ "ok": true, "result": ... }`; failure is `{ "ok": false, "error": string }`.
-- `GET /health` returns workspace, editor, integration, and capability status.
+- `GET /health` returns all allowlisted workspaces plus their editor, Git, integration, and shared capability status.
 - `GET /events` is an SSE stream of file changes and terminal job output.
 - Every request requires `Authorization: Bearer <token>`.
 
@@ -79,7 +80,7 @@ Local-first Persian web coding agent. The React client talks to an OpenAI- or An
 
 ## Deployment notes
 
-- Run `npm run bridge -- --workspace "C:\\path\\to\\repo"`, then `npm run dev`.
+- Run `npm run bridge -- --workspace "C:\\path\\to\\repo"`, then `npm run dev`. Repeat `--workspace` to expose additional explicit roots.
 - Add `--allow-write` or `--allow-shell` only when those capabilities are intended.
 - GitHub read access uses `gh auth status`; authenticate with `gh auth login` outside the app.
 - Do not publish the browser-key architecture without a server-side credential proxy and authenticated user isolation.

@@ -12,10 +12,21 @@ import type {
   EditResult,
   GitCommit,
   GitStatus,
+  Project,
   ShellJob,
   WorkspaceEntry,
   WorkspaceFile,
+  WorkspaceInfo,
 } from '../types'
+
+/**
+ * A connection plus the root a call is aimed at. Every typed helper below takes
+ * one of these, so adding a workspace never changes a call site's shape.
+ */
+export interface BridgeTarget {
+  config: BridgeConfig
+  workspace: string
+}
 
 export class BridgeError extends Error {
   constructor(message: string) {
@@ -55,8 +66,62 @@ async function readResult<T>(response: Response): Promise<T> {
   return (body?.result ?? body) as T
 }
 
+/**
+ * A sidecar from before multi-root answered with a single `workspace` object.
+ * Folding it into a one-element list keeps an older running bridge usable
+ * instead of failing with a confusing "no workspaces" screen.
+ */
+function normalizeStatus(raw: BridgeStatus & { workspace?: Partial<WorkspaceInfo> }): BridgeStatus {
+  if (Array.isArray(raw.workspaces) && raw.workspaces.length) {
+    return { ...raw, workspaces: raw.workspaces }
+  }
+
+  const legacy = raw as unknown as {
+    workspace?: { name?: string; root?: string }
+    editors?: WorkspaceInfo['editors']
+    git?: WorkspaceInfo['git']
+    github?: WorkspaceInfo['github']
+  }
+  if (!legacy.workspace?.root) return { ...raw, workspaces: [] }
+
+  return {
+    ...raw,
+    workspaces: [{
+      id: 'default',
+      name: legacy.workspace.name || legacy.workspace.root,
+      root: legacy.workspace.root,
+      editors: legacy.editors,
+      git: legacy.git ?? { available: false },
+      github: legacy.github ?? { available: false },
+    }],
+  }
+}
+
 export async function probeBridge(config: BridgeConfig, signal?: AbortSignal): Promise<BridgeStatus> {
-  return readResult<BridgeStatus>(await bridgeFetch(config, '/health', { signal }))
+  return normalizeStatus(await readResult(await bridgeFetch(config, '/health', { signal })))
+}
+
+/**
+ * Which root the app should be pointed at: the active project's folder when it
+ * is connected, otherwise the user's manual pick, otherwise the first root.
+ */
+export function resolveWorkspace(
+  status: BridgeStatus | null,
+  project: Project | null,
+  fallbackId?: string | null,
+): WorkspaceInfo | null {
+  const list = status?.workspaces ?? []
+  if (!list.length) return null
+
+  if (project?.workspaceRoot) {
+    const linked = list.find((item) => item.root === project.workspaceRoot)
+      ?? (project.workspaceId ? list.find((item) => item.id === project.workspaceId) : undefined)
+    // A project pinned to a folder that is not connected has no workspace at
+    // all — silently falling back to another repo would edit the wrong code.
+    return linked ?? null
+  }
+
+  return list.find((item) => item.id === fallbackId) ?? list[0]
 }
 
 export async function callBridge<T = unknown>(
@@ -82,65 +147,74 @@ export async function callBridge<T = unknown>(
  * The methods the UI itself uses. The model reaches the same sidecar through
  * `lib/tools.ts`, which keeps its own allow-list and approval gate.
  */
-export const workspaceApi = {
-  children: (config: BridgeConfig, path = '.', signal?: AbortSignal) =>
-    callBridge<{ path: string; entries: WorkspaceEntry[] }>(config, 'workspace.children', { path }, signal),
+function callTarget<T = unknown>(
+  target: BridgeTarget,
+  method: string,
+  params: Record<string, unknown> = {},
+  signal?: AbortSignal,
+): Promise<T> {
+  return callBridge<T>(target.config, method, { ...params, workspace: target.workspace }, signal)
+}
 
-  read: (config: BridgeConfig, path: string, signal?: AbortSignal) =>
-    callBridge<WorkspaceFile>(config, 'workspace.read', { path }, signal),
+export const workspaceApi = {
+  children: (target: BridgeTarget, path = '.', signal?: AbortSignal) =>
+    callTarget<{ path: string; entries: WorkspaceEntry[] }>(target, 'workspace.children', { path }, signal),
+
+  read: (target: BridgeTarget, path: string, signal?: AbortSignal) =>
+    callTarget<WorkspaceFile>(target, 'workspace.read', { path }, signal),
 
   search: (
-    config: BridgeConfig,
+    target: BridgeTarget,
     params: { query: string; path?: string; include?: string; regex?: boolean; maxResults?: number },
     signal?: AbortSignal,
   ) =>
-    callBridge<{ matches: Array<{ path: string; line: number; preview: string }>; scanned: number; truncated: boolean }>(
-      config, 'workspace.search', params, signal,
+    callTarget<{ matches: Array<{ path: string; line: number; preview: string }>; scanned: number; truncated: boolean }>(
+      target, 'workspace.search', params, signal,
     ),
 
-  write: (config: BridgeConfig, path: string, content: string, signal?: AbortSignal) =>
-    callBridge<EditResult>(config, 'workspace.write', { path, content }, signal),
+  write: (target: BridgeTarget, path: string, content: string, signal?: AbortSignal) =>
+    callTarget<EditResult>(target, 'workspace.write', { path, content }, signal),
 
-  openInEditor: (config: BridgeConfig, path: string, line?: number, editor?: string) =>
-    callBridge<{ opened: string; editor: string; line?: number }>(config, 'editor.open', { path, line, editor }),
+  openInEditor: (target: BridgeTarget, path: string, line?: number, editor?: string) =>
+    callTarget<{ opened: string; editor: string; line?: number }>(target, 'editor.open', { path, line, editor }),
 }
 
 export const gitApi = {
-  status: (config: BridgeConfig, signal?: AbortSignal) =>
-    callBridge<GitStatus>(config, 'git.status', {}, signal),
+  status: (target: BridgeTarget, signal?: AbortSignal) =>
+    callTarget<GitStatus>(target, 'git.status', {}, signal),
 
-  diff: (config: BridgeConfig, params: { path?: string; staged?: boolean } = {}, signal?: AbortSignal) =>
-    callBridge<{ ok: boolean; stdout: string; stderr: string }>(config, 'git.diff', params, signal),
+  diff: (target: BridgeTarget, params: { path?: string; staged?: boolean } = {}, signal?: AbortSignal) =>
+    callTarget<{ ok: boolean; stdout: string; stderr: string }>(target, 'git.diff', params, signal),
 
-  log: (config: BridgeConfig, limit = 20, signal?: AbortSignal) =>
-    callBridge<{ commits: GitCommit[] }>(config, 'git.log', { limit }, signal),
+  log: (target: BridgeTarget, limit = 20, signal?: AbortSignal) =>
+    callTarget<{ commits: GitCommit[] }>(target, 'git.log', { limit }, signal),
 
-  branches: (config: BridgeConfig, signal?: AbortSignal) =>
-    callBridge<{ branches: Array<{ name: string; current: boolean; upstream?: string }> }>(
-      config, 'git.branches', {}, signal,
+  branches: (target: BridgeTarget, signal?: AbortSignal) =>
+    callTarget<{ branches: Array<{ name: string; current: boolean; upstream?: string }> }>(
+      target, 'git.branches', {}, signal,
     ),
 
-  stage: (config: BridgeConfig, paths: string[]) =>
-    callBridge<{ ok: boolean; stderr: string }>(config, 'git.add', { paths }),
+  stage: (target: BridgeTarget, paths: string[]) =>
+    callTarget<{ ok: boolean; stderr: string }>(target, 'git.add', { paths }),
 
-  unstage: (config: BridgeConfig, path?: string) =>
-    callBridge<{ ok: boolean; stderr: string }>(config, 'git.unstage', { path }),
+  unstage: (target: BridgeTarget, path?: string) =>
+    callTarget<{ ok: boolean; stderr: string }>(target, 'git.unstage', { path }),
 
-  commit: (config: BridgeConfig, message: string, all = false) =>
-    callBridge<{ ok: boolean; stdout: string; stderr: string }>(config, 'git.commit', { message, all }),
+  commit: (target: BridgeTarget, message: string, all = false) =>
+    callTarget<{ ok: boolean; stdout: string; stderr: string }>(target, 'git.commit', { message, all }),
 }
 
 export const shellApi = {
-  start: (config: BridgeConfig, command: string, cwd = '.') =>
-    callBridge<ShellJob>(config, 'shell.start', { command, cwd }),
+  start: (target: BridgeTarget, command: string, cwd = '.') =>
+    callTarget<ShellJob>(target, 'shell.start', { command, cwd }),
 
-  poll: (config: BridgeConfig, id: string, offset: number, signal?: AbortSignal) =>
-    callBridge<ShellJob & { output: string; offset: number }>(config, 'shell.poll', { id, offset }, signal),
+  poll: (target: BridgeTarget, id: string, offset: number, signal?: AbortSignal) =>
+    callTarget<ShellJob & { output: string; offset: number }>(target, 'shell.poll', { id, offset }, signal),
 
-  kill: (config: BridgeConfig, id: string) => callBridge<ShellJob>(config, 'shell.kill', { id }),
+  kill: (target: BridgeTarget, id: string) => callTarget<ShellJob>(target, 'shell.kill', { id }),
 
-  jobs: (config: BridgeConfig, signal?: AbortSignal) =>
-    callBridge<{ jobs: ShellJob[] }>(config, 'shell.jobs', {}, signal),
+  jobs: (target: BridgeTarget, signal?: AbortSignal) =>
+    callTarget<{ jobs: ShellJob[] }>(target, 'shell.jobs', {}, signal),
 }
 
 /* -------------------------------------------------------------------------- */
