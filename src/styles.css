@@ -1567,7 +1567,9 @@ a:hover {
 }
 
 .composer-box {
+  position: relative;
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-end;
   gap: 8px;
   padding: 9px 10px 9px 9px;
@@ -1640,6 +1642,146 @@ a:hover {
   border-radius: 5px;
   padding: 1px 5px;
   font-size: 10.5px;
+}
+
+/* ------------------------------ attachments ----------------------------- */
+
+.composer-box.dragging {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow-md);
+}
+
+.composer-drop {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-xl);
+  background: var(--surface);
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+  pointer-events: none;
+}
+
+.composer-attach {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  color: var(--text-faint);
+  flex-shrink: 0;
+  transition: background 0.16s var(--ease), color 0.16s var(--ease);
+}
+
+.composer-attach:hover:not(:disabled) {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.composer-attach:disabled {
+  opacity: 0.45;
+}
+
+.attachments {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 2px 4px 4px;
+}
+
+.attachment {
+  position: relative;
+  width: 76px;
+  margin: 0;
+}
+
+.attachment img {
+  width: 76px;
+  height: 76px;
+  object-fit: cover;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  display: block;
+}
+
+.attachment figcaption {
+  margin-top: 3px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  text-align: center;
+}
+
+.attachment-remove {
+  position: absolute;
+  top: -6px;
+  inset-inline-end: -6px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+.attachment-remove:hover {
+  background: var(--danger);
+  color: #fff;
+}
+
+.msg-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.msg-attachment {
+  padding: 0;
+  border-radius: var(--r-md);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  line-height: 0;
+}
+
+.msg-attachment img {
+  max-width: 220px;
+  max-height: 220px;
+  object-fit: cover;
+  display: block;
+}
+
+.msg-attachment.missing {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-faint);
+  background: var(--surface-2);
+}
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  background: rgba(0, 0, 0, 0.8);
+  cursor: zoom-out;
+}
+
+.lightbox img {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-md);
 }
 
 /* ================================= modal ================================= */

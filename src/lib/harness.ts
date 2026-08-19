@@ -28,9 +28,17 @@ export const MAX_TOOL_STEPS = 6
 /** Characters of a project file inlined into the prompt before it is trimmed. */
 const FILE_INLINE_LIMIT = 2400
 
+/** What one attached image costs the prompt, in the same rough token unit. */
+const IMAGE_TOKENS = 800
+
 /** Rough token estimate. Persian text packs fewer characters per token. */
 export function estimate(text: string): number {
   return Math.ceil(text.length / 3.2)
+}
+
+/** Attached images are billed as tokens too, so the window must count them. */
+function imageCost(message: Message): number {
+  return (message.attachments?.length ?? 0) * IMAGE_TOKENS
 }
 
 /* -------------------------------------------------------------------------- */
@@ -179,14 +187,16 @@ export interface ContextPlan {
  * even if it alone blows the budget — trimming it would break the answer.
  */
 export function planContext(history: Message[], reserved: number, budget: number): ContextPlan {
-  const usable = history.filter((m) => m.role !== 'system' && !m.error && m.content.trim() !== '')
+  const usable = history.filter(
+    (m) => m.role !== 'system' && !m.error && (m.content.trim() !== '' || m.attachments?.length),
+  )
   const room = Math.max(1200, budget - reserved)
 
   const kept: Message[] = []
   let used = 0
 
   for (let i = usable.length - 1; i >= 0; i--) {
-    const cost = estimate(usable[i].content) + 8
+    const cost = estimate(usable[i].content) + 8 + imageCost(usable[i])
     if (kept.length >= 2 && used + cost > room) break
     kept.unshift(usable[i])
     used += cost

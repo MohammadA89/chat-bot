@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties }
 import type {
   ApiConfig,
   ApprovalRequest,
+  Attachment,
   BridgeConfig,
   BridgeEvent,
   BridgeStatus,
@@ -54,6 +55,7 @@ export default function App() {
   const [settings, setSettings] = useState<Settings>(() => storage.loadSettings())
   const [model, setModel] = useState('')
   const [input, setInput] = useState('')
+  const [attachments, setAttachments] = useState<Attachment[]>([])
   const [streaming, setStreaming] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(() => !isMobileViewport())
   const [showSettings, setShowSettings] = useState(false)
@@ -208,6 +210,7 @@ export default function App() {
     setConversations((list) => [conversation, ...list])
     setActiveId(conversation.id)
     setInput('')
+    setAttachments([])
     if (isMobileViewport()) setSidebarOpen(false)
   }, [activeProjectId, model])
 
@@ -385,25 +388,27 @@ export default function App() {
 
   const send = useCallback(async () => {
     const text = input.trim()
-    if (!text || streaming || !config || !model) return
+    // An image on its own is enough to ask about — text is not required.
+    if ((!text && attachments.length === 0) || streaming || !config || !model) return
     let conversation = active
     if (!conversation) {
       conversation = { ...createConversation(model), id: uid(), projectId: activeProjectId }
       setConversations((list) => [conversation!, ...list])
       setActiveId(conversation.id)
     }
-    const userMessage = createMessage('user', text)
+    const userMessage = createMessage('user', text, attachments.length ? { attachments } : {})
     const history = [...conversation.messages, userMessage]
     patchConversation(conversation.id, (current) => ({
       ...current,
-      title: current.messages.length === 0 ? deriveTitle(text) : current.title,
+      title: current.messages.length === 0 ? deriveTitle(text || 'گفتگو درباره‌ی تصویر') : current.title,
       messages: [...current.messages, userMessage],
       updatedAt: Date.now(),
     }))
     setInput('')
+    setAttachments([])
     setAtBottom(true)
     await runCompletion(conversation.id, history)
-  }, [active, activeProjectId, config, input, model, patchConversation, runCompletion, streaming])
+  }, [active, activeProjectId, attachments, config, input, model, patchConversation, runCompletion, streaming])
 
   const regenerate = useCallback(async () => {
     if (!active || streaming) return
@@ -514,7 +519,19 @@ export default function App() {
 
         <div className="composer-wrap">
           {!atBottom && active && active.messages.length > 0 && <button className="scroll-bottom" onClick={() => scrollToBottom()} aria-label="رفتن به انتهای گفتگو"><IconArrowDown /></button>}
-          <Composer value={input} streaming={streaming} disabled={!model} sendOnEnter={settings.sendOnEnter} onChange={setInput} onSend={send} onStop={() => abortRef.current?.abort()} />
+          <Composer
+            value={input}
+            attachments={attachments}
+            streaming={streaming}
+            disabled={!model}
+            sendOnEnter={settings.sendOnEnter}
+            onChange={setInput}
+            onAttach={(added) => setAttachments((list) => [...list, ...added])}
+            onRemoveAttachment={(id) => setAttachments((list) => list.filter((item) => item.id !== id))}
+            onAttachError={(message) => toast(message, 'error')}
+            onSend={send}
+            onStop={() => abortRef.current?.abort()}
+          />
         </div>
       </main>
 
