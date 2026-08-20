@@ -680,3 +680,37 @@ test('a model-specific failure does not block the connection', async () => {
   // 404 means "not that model", not "not your key" — connecting must still work.
   assert.equal(await api.verifyChatAccess(config('openai'), 'no-such-model'), null)
 })
+
+/* --------------------------- unreachable endpoint -------------------------- */
+
+/** A port nothing is listening on, so `fetch` fails at the network layer. */
+async function deadPort() {
+  const probe = createServer(() => {})
+  await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve))
+  const port = probe.address().port
+  await new Promise((resolve) => probe.close(resolve))
+  return port
+}
+
+test('a dead localhost endpoint names the IPv6 trap, not just CORS', async () => {
+  const port = await deadPort()
+  const failure = await api
+    .listModels({ provider: 'openai', baseUrl: `http://localhost:${port}/v1`, apiKey: 'k' })
+    .then(() => null, (error) => error)
+
+  assert.ok(failure, 'an unreachable endpoint must fail')
+  assert.ok(failure.message.includes('اتصال به سرور برقرار نشد'))
+  assert.ok(failure.message.includes('127.0.0.1'), 'the IPv4 fallback must be suggested')
+  assert.ok(failure.message.includes('::1'), 'the real cause must be named')
+})
+
+test('a dead remote endpoint keeps the plain message', async () => {
+  const port = await deadPort()
+  const failure = await api
+    .listModels({ provider: 'openai', baseUrl: `http://127.0.0.1:${port}/v1`, apiKey: 'k' })
+    .then(() => null, (error) => error)
+
+  assert.ok(failure)
+  assert.ok(failure.message.includes('اتصال به سرور برقرار نشد'))
+  assert.ok(!failure.message.includes('::1'), 'the hint is only for a localhost base URL')
+})

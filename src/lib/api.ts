@@ -68,13 +68,32 @@ async function toApiError(res: Response): Promise<ApiError> {
   return new ApiError(detail ? `${head}\n${detail}` : head, res.status)
 }
 
-function networkError(err: unknown): ApiError {
+/**
+ * `localhost` is two addresses, and on Windows the browser tries the IPv6 one
+ * first. A local service bound only to IPv4 (`0.0.0.0` / `127.0.0.1`) is then
+ * unreachable through `localhost` while being perfectly healthy — and `curl`,
+ * which falls back to IPv4, reports it as fine. The failure looks like CORS and
+ * is not, so the hint has to name the real cause.
+ */
+function isLocalHostname(base: string): boolean {
+  try {
+    return new URL(base).hostname.toLowerCase() === 'localhost'
+  } catch {
+    return false
+  }
+}
+
+function networkError(err: unknown, base?: string): ApiError {
   if (err instanceof ApiError) return err
   if (err instanceof DOMException && err.name === 'AbortError') {
     return new ApiError('درخواست لغو شد.')
   }
+  const hint =
+    base && isLocalHostname(base)
+      ? '\nسرویس روی همین دستگاه است: به‌جای localhost آدرس 127.0.0.1 را امتحان کنید. در ویندوز localhost اول به ::1 (IPv6) ترجمه می‌شود و سرویسی که فقط روی IPv4 گوش می‌دهد از این راه دیده نمی‌شود.'
+      : ''
   return new ApiError(
-    'اتصال به سرور برقرار نشد. Base URL را بررسی کنید و مطمئن شوید سرویس اجازه‌ی دسترسی از مرورگر (CORS) را می‌دهد.',
+    `اتصال به سرور برقرار نشد. Base URL را بررسی کنید و مطمئن شوید سرویس اجازه‌ی دسترسی از مرورگر (CORS) را می‌دهد.${hint}`,
   )
 }
 
@@ -104,7 +123,7 @@ export async function listModels(config: ApiConfig, signal?: AbortSignal): Promi
       signal,
     })
   } catch (err) {
-    throw networkError(err)
+    throw networkError(err, base)
   }
   if (!res.ok) throw await toApiError(res)
 
@@ -454,7 +473,7 @@ export async function sendChat(req: ChatRequest): Promise<ChatResult> {
       signal,
     })
   } catch (err) {
-    throw networkError(err)
+    throw networkError(err, base)
   }
   if (!res.ok) throw await toApiError(res)
 
