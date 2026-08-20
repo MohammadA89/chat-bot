@@ -16,6 +16,13 @@ const PROVIDERS: Array<{ id: Provider; name: string; endpoint: string }> = [
   { id: 'anthropic', name: 'Anthropic سازگار', endpoint: '/messages' },
 ]
 
+/**
+ * Set when this build was started with an API proxy configured. It is a plain
+ * path, so choosing it makes every request same-origin — the escape hatch for
+ * an endpoint the browser will not call directly, whoever is serving it.
+ */
+const proxyPath = import.meta.env.VITE_API_PROXY ? '/proxy-api' : ''
+
 export function Setup({ initial, onConnected, onCancel }: SetupProps) {
   const [provider, setProvider] = useState<Provider>(initial?.provider ?? 'openai')
   const [baseUrl, setBaseUrl] = useState(initial?.baseUrl ?? '')
@@ -101,8 +108,18 @@ export function Setup({ initial, onConnected, onCancel }: SetupProps) {
               spellCheck={false}
             />
             <p className="field-hint">
-              اگر انتهای آدرس <code>/v1</code> نباشد، به‌صورت خودکار اضافه می‌شود.
+              اگر انتهای آدرس <code>/v1</code> نباشد، به‌صورت خودکار اضافه می‌شود. آدرسی که با{' '}
+              <code>/</code> شروع شود از همین origin خوانده می‌شود — برای وقتی که پشت یک reverse proxy هستید.
             </p>
+            {proxyPath && baseUrl.trim() !== proxyPath && (
+              <button
+                type="button"
+                className="btn btn-ghost btn-block btn-sm"
+                onClick={() => setBaseUrl(proxyPath)}
+              >
+                استفاده از proxy همین سرور ({proxyPath})
+              </button>
+            )}
           </div>
 
           <div className="field">

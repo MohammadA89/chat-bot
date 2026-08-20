@@ -17,11 +17,17 @@ const ANTHROPIC_VERSION = '2023-06-01'
  * Normalises a user-supplied base URL into a versioned API root.
  * Accepts `https://x.com`, `https://x.com/`, `https://x.com/v1` — all become
  * `https://x.com/v1`. A base that already ends in a version segment is left as is.
+ *
+ * A value starting with `/` is kept as a same-origin path (`/api` → `/api/v1`).
+ * That is how the app is pointed at a reverse proxy — the dev server's, nginx,
+ * a hosted deployment's — which is the only way to reach an endpoint the
+ * browser refuses to call directly, and it belongs to no particular provider.
  */
 export function normalizeBaseUrl(raw: string): string {
   let base = raw.trim().replace(/\/+$/, '')
   if (!base) return ''
-  if (!/^https?:\/\//i.test(base)) base = `https://${base}`
+  const sameOrigin = base.startsWith('/')
+  if (!sameOrigin && !/^https?:\/\//i.test(base)) base = `https://${base}`
   if (!/\/v\d+[a-z]*$/i.test(base)) base = `${base}/v1`
   return base
 }

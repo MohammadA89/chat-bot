@@ -714,3 +714,28 @@ test('a dead remote endpoint keeps the plain message', async () => {
   assert.ok(failure.message.includes('اتصال به سرور برقرار نشد'))
   assert.ok(!failure.message.includes('::1'), 'the hint is only for a localhost base URL')
 })
+
+/* --------------------------- same-origin base URL -------------------------- */
+
+test('a base URL starting with / stays same-origin', () => {
+  assert.equal(api.normalizeBaseUrl('/proxy-api'), '/proxy-api/v1')
+  assert.equal(api.normalizeBaseUrl('/proxy-api/v1'), '/proxy-api/v1')
+  assert.equal(api.normalizeBaseUrl('/api/openai/v1/'), '/api/openai/v1')
+})
+
+test('a bare host still gets a scheme, as before', () => {
+  assert.equal(api.normalizeBaseUrl('api.example.com'), 'https://api.example.com/v1')
+  assert.equal(api.normalizeBaseUrl('http://127.0.0.1:8080'), 'http://127.0.0.1:8080/v1')
+  assert.equal(api.normalizeBaseUrl('  https://x.com/v1/  '), 'https://x.com/v1')
+  assert.equal(api.normalizeBaseUrl(''), '')
+})
+
+test('a same-origin base URL never gets the localhost hint', async () => {
+  // Relative URLs cannot be parsed as absolute, and same-origin requests have
+  // no CORS or IPv6 story at all — the hint would only mislead.
+  const failure = await api
+    .listModels({ provider: 'openai', baseUrl: '/definitely-not-mounted', apiKey: 'k' })
+    .then(() => null, (error) => error)
+  assert.ok(failure)
+  assert.ok(!failure.message.includes('::1'))
+})
