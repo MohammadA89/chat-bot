@@ -184,10 +184,12 @@ export interface ChatRequest {
   /** When present and non-empty, the model may answer with tool calls. */
   tools?: ToolSpec[]
   /**
-   * `auto` lets the model decide; a name forces that one tool. Forcing is only
-   * used by the capability probe — a real turn always leaves the choice open.
+   * `auto` lets the model decide, `required` makes it call *some* tool, and a
+   * name forces that one. A normal round is always `auto`; the other two are
+   * for the capability probe and for pushing a model that answered in text
+   * where it was supposed to act.
    */
-  toolChoice?: 'auto' | { name: string }
+  toolChoice?: 'auto' | 'required' | { name: string }
 }
 
 export interface ChatResult {
@@ -307,6 +309,20 @@ function anthropicMessages(messages: WireMessage[]) {
   return out
 }
 
+/** `tool_choice` in OpenAI's spelling. */
+function openAiToolChoice(choice: ChatRequest['toolChoice']) {
+  if (!choice || choice === 'auto') return 'auto'
+  if (choice === 'required') return 'required'
+  return { type: 'function', function: { name: choice.name } }
+}
+
+/** The same three states in Anthropic's spelling. */
+function anthropicToolChoice(choice: ChatRequest['toolChoice']) {
+  if (!choice || choice === 'auto') return { type: 'auto' }
+  if (choice === 'required') return { type: 'any' }
+  return { type: 'tool', name: choice.name }
+}
+
 function buildBody(req: ChatRequest, provider: Provider) {
   const system = req.systemPrompt.trim()
   const tools = req.tools?.length ? req.tools : undefined
@@ -326,10 +342,7 @@ function buildBody(req: ChatRequest, provider: Provider) {
               description: t.description,
               input_schema: t.parameters,
             })),
-            tool_choice:
-              req.toolChoice && req.toolChoice !== 'auto'
-                ? { type: 'tool', name: req.toolChoice.name }
-                : { type: 'auto' },
+            tool_choice: anthropicToolChoice(req.toolChoice),
           }
         : {}),
     }
@@ -349,10 +362,7 @@ function buildBody(req: ChatRequest, provider: Provider) {
             type: 'function',
             function: { name: t.name, description: t.description, parameters: t.parameters },
           })),
-          tool_choice:
-            req.toolChoice && req.toolChoice !== 'auto'
-              ? { type: 'function', function: { name: req.toolChoice.name } }
-              : 'auto',
+          tool_choice: openAiToolChoice(req.toolChoice),
         }
       : {}),
   }

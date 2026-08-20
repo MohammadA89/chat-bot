@@ -14,6 +14,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { createServer } from 'node:http'
 import { createServer as createViteServer } from 'vite'
 import { createMockServer } from './mock-api.mjs'
 
@@ -574,4 +575,88 @@ test('an announcement after a tool already ran is left alone', async () => {
   })
   assert.equal(turn.toolRuns.filter((run) => run.name === 'workspace_read').length, 1)
   assert.equal(turn.toolCallingFailed, undefined)
+})
+
+/* --------------------------- forcing the call ------------------------------ */
+
+for (const { provider, stream } of MATRIX) {
+  const label = `${provider}/${stream ? 'streaming' : 'non-streaming'}`
+
+  test(`${label}: a model deaf to the correction is forced into a real edit`, async () => {
+    const bridge = fakeBridge()
+    const turn = await runTurn({
+      provider,
+      model: 'mock-deaf',
+      stream,
+      bridge,
+      text: 'README را کامل‌تر کن',
+    })
+
+    const edit = turn.toolRuns.find((run) => run.name === 'workspace_edit')
+    assert.ok(edit, 'the retry must require a tool call, not merely ask for one')
+    assert.equal(edit.ok, true)
+    assert.equal(bridge.files['README.md'].includes('خط دوم به‌روزشده'), true)
+  })
+}
+
+test('the correction round is the only one that forces a tool call', async () => {
+  const bodies = []
+  const spy = createServer(async (req, res) => {
+    const raw = await new Promise((resolve) => {
+      let body = ''
+      req.on('data', (c) => (body += c))
+      req.on('end', () => resolve(body))
+    })
+    if (req.url.includes('/chat/completions')) bodies.push(JSON.parse(raw || '{}'))
+    const proxied = await fetch(`${BASE}${req.url.replace(/^\/v1/, '')}`, {
+      method: req.method,
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer t' },
+      body: raw,
+    })
+    res.writeHead(proxied.status, { 'Content-Type': 'application/json' })
+    res.end(await proxied.text())
+  })
+  await new Promise((resolve) => spy.listen(0, '127.0.0.1', resolve))
+
+  try {
+    await harness.runTurn({
+      config: { provider: 'openai', baseUrl: `http://127.0.0.1:${spy.address().port}/v1`, apiKey: 'k' },
+      model: 'mock-deaf',
+      settings: { ...SETTINGS, streaming: false },
+      conversation: { id: 'c1', title: '', messages: [], model: 'mock-deaf', createdAt: 0, updatedAt: 0 },
+      project: null,
+      history: [{ id: 'm1', role: 'user', content: 'README را کامل‌تر کن', createdAt: Date.now() }],
+      signal: new AbortController().signal,
+      env: makeEnv(fakeBridge()),
+      onDelta: () => {},
+      onToolRun: () => {},
+    })
+  } finally {
+    spy.close()
+  }
+
+  assert.ok(bodies.length >= 3, `expected several rounds, got ${bodies.length}`)
+  assert.equal(bodies[0].tool_choice, 'auto', 'the first round must leave the choice open')
+  assert.ok(
+    bodies.some((body) => body.tool_choice === 'required'),
+    'the correction round must require a call',
+  )
+  assert.equal(
+    bodies.filter((body) => body.tool_choice === 'required').length,
+    1,
+    'forcing is a correction, not the normal mode',
+  )
+})
+
+test('a model that ignores forcing too is reported, not pretended about', async () => {
+  const bridge = fakeBridge()
+  const turn = await runTurn({
+    provider: 'openai',
+    model: 'mock-pseudo',
+    stream: false,
+    bridge,
+    text: 'فایل README را بخوان',
+  })
+  assert.equal(turn.toolCallingFailed, true)
+  assert.equal(turn.toolRuns.length, 0)
 })

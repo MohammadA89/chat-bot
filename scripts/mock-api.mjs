@@ -21,6 +21,7 @@ const MODELS = [
   { id: 'mock-proposer', display_name: 'Mock Proposer', owned_by: 'mock', created: 1719792000 },
   { id: 'mock-announcer', display_name: 'Mock Announcer', owned_by: 'mock', created: 1719792000 },
   { id: 'mock-stubborn', display_name: 'Mock Stubborn Proposer', owned_by: 'mock', created: 1719792000 },
+  { id: 'mock-deaf', display_name: 'Mock Deaf To Words', owned_by: 'mock', created: 1719792000 },
   { id: 'mock-no-tools', display_name: 'Mock Without Tools', owned_by: 'mock', created: 1719792000 },
   { id: 'mock-rejects-tools', display_name: 'Mock Rejecting Tools', owned_by: 'mock', created: 1719792000 },
 ]
@@ -183,9 +184,25 @@ function offeredTools(body) {
  * - `mock-rejects-tools` refuses any request that carries tools (handled earlier).
  * - everything else keeps the original `remember` round-trip.
  */
+function forcesATool(body) {
+  const choice = body.tool_choice
+  if (choice === 'required') return true
+  return Boolean(choice && typeof choice === 'object' && (choice.type === 'any' || choice.type === 'tool'))
+}
+
 function planReply(body, model) {
   const names = offeredTools(body)
   const results = toolResultsSoFar(body)
+
+  // A forced choice is not a suggestion: even the models that answer in text
+  // must call something here, which is what the harness relies on.
+  const deafToForcing = model === 'mock-pseudo' || model === 'mock-stubborn'
+  if (forcesATool(body) && !deafToForcing && !names.includes('probe_ping')) {
+    const wanted = results.length > 0 && names.includes('workspace_edit')
+      ? { name: 'workspace_edit', args: JSON.stringify({ path: 'README.md', oldText: 'خط دوم', newText: 'خط دوم به‌روزشده' }) }
+      : { name: 'workspace_read', args: JSON.stringify({ path: 'README.md' }) }
+    return { calls: [wanted] }
+  }
 
   if (!names.length || model === 'mock-no-tools') return { text: replyFor(model) }
   if (model === 'mock-pseudo') return { text: PSEUDO_REPLY }
@@ -210,6 +227,14 @@ function planReply(body, model) {
     }
     if (results.length > 0) return { text: 'فایل README.md خوانده شد.' }
     return { text: ANNOUNCE_REPLY }
+  }
+
+  if (model === 'mock-deaf') {
+    if (results.length === 0) {
+      return { calls: [{ name: 'workspace_read', args: JSON.stringify({ path: 'README.md' }) }] }
+    }
+    if (results.length > 1) return { text: 'فایل README.md به‌روزرسانی شد.' }
+    return { text: PROPOSAL_REPLY }
   }
 
   // Reads the file, then describes the edit instead of making it. The

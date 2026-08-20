@@ -7,6 +7,7 @@
  * distils durable facts out of the exchange back into project memory.
  */
 import {
+  ApiError,
   complete,
   sendChat,
   toWireMessages,
@@ -477,6 +478,8 @@ export async function runTurn(req: TurnRequest): Promise<TurnResult> {
   let usage: Usage | undefined
   let steps = 0
   let pseudoRetries = 0
+  /** Set by a correction so the next round must call a tool, not talk about it. */
+  let forceNextRound = false
   let unappliedRetries = 0
   let toolCallingFailed = false
 
@@ -490,21 +493,46 @@ export async function runTurn(req: TurnRequest): Promise<TurnResult> {
   for (; steps < MAX_TOOL_STEPS; steps++) {
     let roundText = ''
 
-    const result = await sendChat({
-      config,
-      model,
-      messages: wire,
-      systemPrompt: systemPrompt(),
-      temperature: settings.temperature,
-      maxTokens: settings.maxTokens,
-      stream: settings.streaming,
-      signal,
-      tools,
-      onDelta: (chunk) => {
-        if (chunk.text) roundText += chunk.text
-        req.onDelta(chunk)
-      },
-    })
+    const round = (toolChoice: 'auto' | 'required') => {
+      roundText = ''
+      return sendChat({
+        config,
+        model,
+        messages: wire,
+        systemPrompt: systemPrompt(),
+        temperature: settings.temperature,
+        maxTokens: settings.maxTokens,
+        stream: settings.streaming,
+        signal,
+        tools,
+        toolChoice,
+        onDelta: (chunk) => {
+          if (chunk.text) roundText += chunk.text
+          req.onDelta(chunk)
+        },
+      })
+    }
+
+    // A round that follows a correction stops asking and starts requiring: the
+    // model already answered in text where it was supposed to act, and words
+    // did not move it. Endpoints that reject a forced choice fall back to
+    // `auto`, so an unusual provider costs a retry rather than the whole turn.
+    let result
+    if (forceNextRound && tools) {
+      try {
+        result = await round('required')
+      } catch (error) {
+        if (error instanceof ApiError && error.status && error.status < 500) {
+          req.onDelta({ resetText: true })
+          result = await round('auto')
+        } else {
+          throw error
+        }
+      }
+    } else {
+      result = await round('auto')
+    }
+    forceNextRound = false
 
     usage = mergeUsage(usage, result.usage)
     if (signal.aborted) break
@@ -532,6 +560,7 @@ export async function runTurn(req: TurnRequest): Promise<TurnResult> {
         if (!shirked || unappliedRetries >= MAX_UNAPPLIED_RETRIES) break
 
         unappliedRetries++
+        forceNextRound = true
         req.onDelta({ resetText: true })
         wire.push({ role: 'assistant', content: roundText })
         wire.push({ role: 'user', content: unappliedEditCorrection(shirked) })
@@ -547,6 +576,7 @@ export async function runTurn(req: TurnRequest): Promise<TurnResult> {
       }
 
       pseudoRetries++
+      forceNextRound = true
       wire.push({ role: 'assistant', content: roundText })
       wire.push({ role: 'user', content: PSEUDO_TOOL_CORRECTION })
       continue
