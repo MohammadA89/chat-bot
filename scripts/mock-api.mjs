@@ -6,6 +6,7 @@
  *   node scripts/mock-api.mjs            # http://localhost:8787/v1
  */
 import { createServer } from 'node:http'
+import { pathToFileURL } from 'node:url'
 
 const PORT = Number(process.env.PORT ?? 8787)
 
@@ -13,6 +14,12 @@ const MODELS = [
   { id: 'mock-pro', display_name: 'Mock Pro', owned_by: 'mock', created: 1735689600 },
   { id: 'mock-lite', display_name: 'Mock Lite', owned_by: 'mock', created: 1727740800 },
   { id: 'mock-reasoning', display_name: 'Mock Reasoning', owned_by: 'mock', created: 1719792000 },
+  // Workspace-capable and deliberately broken models, used by scripts/agent-tests.mjs.
+  { id: 'mock-workspace', display_name: 'Mock Workspace', owned_by: 'mock', created: 1719792000 },
+  { id: 'mock-editor', display_name: 'Mock Editor', owned_by: 'mock', created: 1719792000 },
+  { id: 'mock-pseudo', display_name: 'Mock Pseudo Tools', owned_by: 'mock', created: 1719792000 },
+  { id: 'mock-no-tools', display_name: 'Mock Without Tools', owned_by: 'mock', created: 1719792000 },
+  { id: 'mock-rejects-tools', display_name: 'Mock Rejecting Tools', owned_by: 'mock', created: 1719792000 },
 ]
 
 const REPLY = `### پاسخ نمونه
@@ -98,27 +105,89 @@ const sse = (data) => `data: ${JSON.stringify(data)}\n\n`
 const chunks = (text) => text.match(/[\s\S]{1,24}/g) ?? []
 
 /**
- * The mock plays along with the harness: the first request that carries tools
- * answers with a tool call, and once the result comes back it writes the reply.
- * That exercises the whole loop without a real provider.
+ * A reply that *looks* like a tool call but is only text — the failure mode the
+ * harness has to recognise and refuse to act on.
  */
-function wantsToolCall(body) {
-  if (!body.tools?.length) return false
-  const already = (body.messages ?? []).some(
-    (m) =>
-      m.role === 'tool' ||
-      (Array.isArray(m.content) && m.content.some((b) => b?.type === 'tool_result')),
-  )
-  if (already) return false
-  const names = body.tools.map((t) => t.function?.name ?? t.name)
-  return names.includes('remember')
-}
+const PSEUDO_REPLY = `برای خواندن فایل باید ابزار زیر را صدا بزنیم:
+
+\`\`\`json
+{ "name": "workspace_read", "arguments": { "path": "README.md" } }
+\`\`\`
+
+بعد از آن می‌توانیم با \`workspace_edit\` بخش نصب را کامل‌تر کنیم.`
 
 const TOOL_ARGS = JSON.stringify({
   facts: ['کاربر رابط فارسی و راست‌به‌چپ می‌خواهد.', 'پروژه با React و Vite ساخته می‌شود.'],
 })
 
-const server = createServer(async (req, res) => {
+/** Tool results already in the conversation, in either protocol's shape. */
+function toolResultsSoFar(body) {
+  const results = []
+  for (const m of body.messages ?? []) {
+    if (m.role === 'tool') results.push(String(m.content ?? ''))
+    else if (Array.isArray(m.content)) {
+      for (const block of m.content) {
+        if (block?.type === 'tool_result') results.push(String(block.content ?? ''))
+      }
+    }
+  }
+  return results
+}
+
+function offeredTools(body) {
+  return (body.tools ?? []).map((t) => t.function?.name ?? t.name)
+}
+
+/**
+ * Decides what the mock answers with. Each mock model stands for one real-world
+ * provider behaviour, so the harness can be exercised end to end:
+ *
+ * - `mock-workspace` reads a file, then answers from the tool output.
+ * - `mock-editor` reads, then edits.
+ * - `mock-pseudo` prints a tool call as text and never makes a real one.
+ * - `mock-no-tools` ignores the tools it was offered.
+ * - `mock-rejects-tools` refuses any request that carries tools (handled earlier).
+ * - everything else keeps the original `remember` round-trip.
+ */
+function planReply(body, model) {
+  const names = offeredTools(body)
+  const results = toolResultsSoFar(body)
+
+  if (!names.length || model === 'mock-no-tools') return { text: replyFor(model) }
+  if (model === 'mock-pseudo') return { text: PSEUDO_REPLY }
+  if (names.includes('probe_ping')) {
+    return { calls: [{ name: 'probe_ping', args: JSON.stringify({ token: 'pong' }) }] }
+  }
+
+  if (model === 'mock-workspace') {
+    if (results.length === 0) {
+      return { calls: [{ name: 'workspace_read', args: JSON.stringify({ path: 'README.md' }) }] }
+    }
+    return { text: `محتوای واقعی فایل: ${results[results.length - 1].slice(0, 160)}` }
+  }
+
+  if (model === 'mock-editor') {
+    if (results.length === 0) {
+      return { calls: [{ name: 'workspace_read', args: JSON.stringify({ path: 'README.md' }) }] }
+    }
+    if (results.length === 1) {
+      return {
+        calls: [{
+          name: 'workspace_edit',
+          args: JSON.stringify({ path: 'README.md', oldText: 'خط دوم', newText: 'خط دوم به‌روزشده' }),
+        }],
+      }
+    }
+    return { text: `نتیجه‌ی ویرایش: ${results[results.length - 1].slice(0, 160)}` }
+  }
+
+  if (results.length === 0 && names.includes('remember')) {
+    return { calls: [{ name: 'remember', args: TOOL_ARGS }] }
+  }
+  return { text: replyFor(model) }
+}
+
+const handler = async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`)
   const path = url.pathname.replace(/^\/v1/, '')
 
@@ -141,31 +210,40 @@ const server = createServer(async (req, res) => {
   if (path === '/chat/completions' && req.method === 'POST') {
     const body = await readBody(req)
     const model = body.model ?? 'mock-pro'
-    const reply = replyFor(model)
+    if (model === 'mock-rejects-tools' && body.tools?.length) {
+      return json(res, 400, { error: { message: 'This model does not support tools.' } })
+    }
+    const plan = planReply(body, model)
 
-    if (wantsToolCall(body)) {
-      const call = { id: 'call_mock_1', type: 'function', function: { name: 'remember', arguments: TOOL_ARGS } }
+    if (plan.calls) {
+      const calls = plan.calls.map((c, i) => ({
+        id: `call_mock_${i + 1}`,
+        type: 'function',
+        function: { name: c.name, arguments: c.args },
+      }))
       if (!body.stream) {
         return json(res, 200, {
           id: 'cmpl-mock',
           model,
           choices: [
-            { index: 0, message: { role: 'assistant', content: null, tool_calls: [call] }, finish_reason: 'tool_calls' },
+            { index: 0, message: { role: 'assistant', content: null, tool_calls: calls }, finish_reason: 'tool_calls' },
           ],
           usage: { prompt_tokens: 40, completion_tokens: 20, total_tokens: 60 },
         })
       }
-      const toolFrames = [
-        sse({ id: 'cmpl-mock', model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: call.id, type: 'function', function: { name: 'remember', arguments: '' } }] } }] }),
-        ...chunks(TOOL_ARGS).map((piece) =>
-          sse({ id: 'cmpl-mock', model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: piece } }] } }] }),
-        ),
-        sse({ id: 'cmpl-mock', model, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }),
-        'data: [DONE]\n\n',
-      ]
+      const toolFrames = []
+      calls.forEach((call, index) => {
+        toolFrames.push(sse({ id: 'cmpl-mock', model, choices: [{ index: 0, delta: { tool_calls: [{ index, id: call.id, type: 'function', function: { name: call.function.name, arguments: '' } }] } }] }))
+        for (const piece of chunks(call.function.arguments)) {
+          toolFrames.push(sse({ id: 'cmpl-mock', model, choices: [{ index: 0, delta: { tool_calls: [{ index, function: { arguments: piece } }] } }] }))
+        }
+      })
+      toolFrames.push(sse({ id: 'cmpl-mock', model, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }))
+      toolFrames.push('data: [DONE]\n\n')
       return streamFrames(res, toolFrames)
     }
 
+    const reply = plan.text
     if (!body.stream) {
       return json(res, 200, {
         id: 'cmpl-mock',
@@ -185,32 +263,42 @@ const server = createServer(async (req, res) => {
   if (path === '/messages' && req.method === 'POST') {
     const body = await readBody(req)
     const model = body.model ?? 'mock-pro'
-    const reply = replyFor(model)
+    if (model === 'mock-rejects-tools' && body.tools?.length) {
+      return json(res, 400, { error: { message: 'This model does not support tools.' } })
+    }
+    const plan = planReply(body, model)
 
-    if (wantsToolCall(body)) {
-      const input = JSON.parse(TOOL_ARGS)
+    if (plan.calls) {
       if (!body.stream) {
         return json(res, 200, {
           id: 'msg-mock',
           model,
           stop_reason: 'tool_use',
-          content: [{ type: 'tool_use', id: 'toolu_mock_1', name: 'remember', input }],
+          content: plan.calls.map((c, i) => ({
+            type: 'tool_use',
+            id: `toolu_mock_${i + 1}`,
+            name: c.name,
+            input: JSON.parse(c.args),
+          })),
           usage: { input_tokens: 40, output_tokens: 20 },
         })
       }
       const toolFrames = [
         sse({ type: 'message_start', message: { id: 'msg-mock', model, usage: { input_tokens: 40, output_tokens: 0 } } }),
-        sse({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_mock_1', name: 'remember', input: {} } }),
-        ...chunks(TOOL_ARGS).map((piece) =>
-          sse({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: piece } }),
-        ),
-        sse({ type: 'content_block_stop', index: 0 }),
-        sse({ type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 20 } }),
-        sse({ type: 'message_stop' }),
       ]
+      plan.calls.forEach((call, index) => {
+        toolFrames.push(sse({ type: 'content_block_start', index, content_block: { type: 'tool_use', id: `toolu_mock_${index + 1}`, name: call.name, input: {} } }))
+        for (const piece of chunks(call.args)) {
+          toolFrames.push(sse({ type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: piece } }))
+        }
+        toolFrames.push(sse({ type: 'content_block_stop', index }))
+      })
+      toolFrames.push(sse({ type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 20 } }))
+      toolFrames.push(sse({ type: 'message_stop' }))
       return streamFrames(res, toolFrames)
     }
 
+    const reply = plan.text
     if (!body.stream) {
       return json(res, 200, {
         id: 'msg-mock',
@@ -233,8 +321,16 @@ const server = createServer(async (req, res) => {
   }
 
   return json(res, 404, { error: { message: `Unknown route: ${url.pathname}` } })
-})
+}
 
-server.listen(PORT, () => {
-  console.log(`Mock API listening on http://localhost:${PORT}/v1`)
-})
+/** A fresh, unbound server — the tests start one on an ephemeral port. */
+export function createMockServer() {
+  return createServer(handler)
+}
+
+// Only listen when run directly, so importing this file for tests is cheap.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  createMockServer().listen(PORT, () => {
+    console.log(`Mock API listening on http://localhost:${PORT}/v1`)
+  })
+}

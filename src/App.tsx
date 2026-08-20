@@ -12,10 +12,10 @@ import type {
   Project,
   Settings,
 } from './types'
-import { ApiError, listModels } from './lib/api'
+import { ApiError, listModels, probeToolSupport, type ToolSupport } from './lib/api'
 import { callBridge, probeBridge, resolveWorkspace, subscribeBridgeEvents } from './lib/bridge'
 import { extractFacts, runTurn } from './lib/harness'
-import { storage } from './lib/storage'
+import { storage, toolSupportKey, type ToolSupportMap } from './lib/storage'
 import { addFacts } from './lib/tools'
 import { createConversation, createMessage, deriveTitle, toFa, uid } from './lib/utils'
 import { Setup } from './components/Setup'
@@ -33,6 +33,7 @@ import { Welcome } from './components/Welcome'
 import { useToasts } from './hooks/useToasts'
 import { isMobileViewport, useIsMobile } from './hooks/useMediaQuery'
 import {
+  IconAlert,
   IconArrowDown,
   IconCode,
   IconFolder,
@@ -70,6 +71,9 @@ export default function App() {
   const [bridgeEvent, setBridgeEvent] = useState<BridgeEvent | null>(null)
   const [approval, setApproval] = useState<ApprovalRequest | null>(null)
   const [layout, setLayout] = useState(() => storage.loadLayout())
+  /** Probe verdicts per provider+model, so a model is only tested once. */
+  const [toolSupport, setToolSupport] = useState<ToolSupportMap>(() => storage.loadToolSupport())
+  const [probing, setProbing] = useState(false)
 
   const mobile = useIsMobile()
   const abortRef = useRef<AbortController | null>(null)
@@ -98,6 +102,20 @@ export default function App() {
   )
   /** Set when the open project points at a folder this bridge is not serving. */
   const missingWorkspace = Boolean(bridgeStatus && activeProject?.workspaceRoot && !activeWorkspace)
+  /**
+   * The real reason the workspace tools are absent this turn, or `undefined`
+   * when they are live. The model is told this verbatim so it reports the
+   * actual obstacle instead of improvising around it.
+   */
+  const workspaceBlocked = useMemo(() => {
+    if (activeWorkspace && bridgeConfig && bridgeStatus) return undefined
+    if (missingWorkspace) {
+      return `پوشه‌ی «${activeProject?.workspaceRoot}» که این پروژه به آن وصل است، در پل محلی باز نیست.`
+    }
+    if (bridgeConfig && !bridgeStatus) return 'پل محلی Workspace در دسترس نیست و اتصال برقرار نشد.'
+    if (bridgeStatus && !activeWorkspace) return 'هیچ Workspace فعالی انتخاب نشده است.'
+    return 'کاربر هنوز پل محلی Workspace را وصل نکرده است.'
+  }, [activeProject?.workspaceRoot, activeWorkspace, bridgeConfig, bridgeStatus, missingWorkspace])
 
   useEffect(() => {
     const timer = setTimeout(() => storage.saveConversations(conversations), 300)
@@ -111,6 +129,7 @@ export default function App() {
   useEffect(() => storage.saveActiveProjectId(activeProjectId), [activeProjectId])
   useEffect(() => storage.saveActiveWorkspaceId(activeWorkspaceId), [activeWorkspaceId])
   useEffect(() => storage.saveLayout(layout), [layout])
+  useEffect(() => storage.saveToolSupport(toolSupport), [toolSupport])
   useEffect(() => storage.saveSettings(settings), [settings])
   useEffect(() => document.documentElement.setAttribute('data-theme', settings.theme), [settings.theme])
 
@@ -197,6 +216,49 @@ export default function App() {
     const saved = active?.model
     if (saved && models.some((item) => item.id === saved)) setModel(saved)
   }, [activeId, models]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* ----------------------------- tool capability ---------------------------- */
+
+  const supportKey = config && model ? toolSupportKey(config, model) : ''
+  /** What we know about the active model: probed verdict, or `unknown`. */
+  const modelToolSupport: ToolSupport = toolSupport[supportKey]?.support ?? 'unknown'
+  const toolSupportReason = toolSupport[supportKey]?.reason ?? ''
+
+  const recordToolSupport = useCallback((key: string, support: ToolSupport, reason: string) => {
+    if (!key || support === 'unknown') return
+    setToolSupport((map) => ({ ...map, [key]: { support, reason, at: Date.now() } }))
+  }, [])
+
+  /**
+   * Proves the selected model really speaks function calling before the agent
+   * is trusted with the workspace. It runs once per provider+model and touches
+   * nothing but the chat endpoint.
+   */
+  const probeModel = useCallback(async (force = false) => {
+    if (!config || !model || !settings.toolsEnabled) return
+    const key = toolSupportKey(config, model)
+    if (!force && toolSupport[key]) return
+    setProbing(true)
+    try {
+      const { support, reason } = await probeToolSupport(config, model)
+      recordToolSupport(key, support, reason)
+      if (force) {
+        toast(support === 'supported' ? 'مدل از ابزارها پشتیبانی می‌کند' : reason,
+          support === 'supported' ? 'success' : 'error')
+      }
+    } catch {
+      // A failed probe proves nothing — leave the verdict unknown and let the
+      // turn itself decide, rather than disabling tools on a network blip.
+      if (force) toast('بررسی سازگاری ابزار ناموفق بود', 'error')
+    } finally {
+      setProbing(false)
+    }
+  }, [config, model, recordToolSupport, settings.toolsEnabled, toast, toolSupport])
+
+  // Probe when the workspace is live, where a fake tool call does real damage.
+  useEffect(() => {
+    if (bridgeStatus && activeWorkspace) void probeModel()
+  }, [bridgeStatus, activeWorkspace, probeModel])
 
   /** Choosing a model applies it to the open chat as well, in one direction. */
   const selectModel = useCallback((id: string) => {
@@ -346,7 +408,13 @@ export default function App() {
             },
           } : {}),
         },
-        onDelta: ({ text, reasoning: thought, reclassifyAsReasoning }) => {
+        toolSupport: modelToolSupport,
+        workspaceBlocked,
+        onToolSupport: (support, reason) => recordToolSupport(toolSupportKey(config, model), support, reason),
+        onDelta: ({ text, reasoning: thought, reclassifyAsReasoning, resetText }) => {
+          // A discarded round (a printed tool call) must leave no trace in the
+          // transcript, so the reset happens before this chunk's own text.
+          if (resetText) answer = ''
           if (text) answer += text
           if (thought) reasoning += thought
           if (reclassifyAsReasoning) { reasoning += answer; answer = '' }
@@ -372,14 +440,18 @@ export default function App() {
         usage: result.usage,
         toolRuns: result.toolRuns,
         stopped: stopped || undefined,
+        // The model never really ran anything: flag it so the reply is styled
+        // as the failure it is and never replayed to the model as context.
+        error: result.toolCallingFailed || undefined,
       }
+      if (result.toolCallingFailed) toast('این مدل ابزارها را واقعاً اجرا نمی‌کند', 'error')
       patchConversation(conversationId, (conversation) => ({
         ...conversation,
         updatedAt: Date.now(),
         messages: conversation.messages.map((message) => message.id === placeholder.id ? finalMessage : message),
       }))
 
-      if (projectDraft && settings.autoMemory && !stopped && answer.trim()) {
+      if (projectDraft && settings.autoMemory && !stopped && !result.toolCallingFailed && answer.trim()) {
         const memoryProject = projectDraft
         void extractFacts(config, model, memoryProject, [...history.slice(-1), finalMessage])
           .then((facts) => {
@@ -404,7 +476,7 @@ export default function App() {
       abortRef.current = null
       setStreaming(false)
     }
-  }, [activeWorkspace, bridgeConfig, bridgeStatus, config, conversations, model, patchConversation, projects, requestApproval, settings, toast])
+  }, [activeWorkspace, bridgeConfig, bridgeStatus, config, conversations, model, modelToolSupport, patchConversation, projects, recordToolSupport, requestApproval, settings, toast, workspaceBlocked])
 
   const send = useCallback(async () => {
     const text = input.trim()
@@ -545,8 +617,35 @@ export default function App() {
               ))}
             </select>
           )}
-          <ModelPicker models={models} value={model} loading={modelsLoading} onChange={selectModel} onRefresh={() => refreshModels(config)} />
+          <ModelPicker
+            models={models}
+            value={model}
+            loading={modelsLoading}
+            onChange={selectModel}
+            onRefresh={() => refreshModels(config)}
+            supportOf={(id) => toolSupport[toolSupportKey(config, id)]?.support ?? 'unknown'}
+            supportReason={toolSupportReason}
+            probing={probing}
+            onProbe={() => void probeModel(true)}
+          />
         </header>
+
+        {activeWorkspace && !settings.toolsEnabled && (
+          <div className="agent-banner">
+            <IconAlert size={14} />
+            <span>ابزارها در تنظیمات خاموش‌اند، پس دستیار به فایل‌های Workspace دسترسی ندارد.</span>
+            <button className="btn btn-ghost btn-xs" onClick={() => setShowSettings(true)}>تنظیمات</button>
+          </div>
+        )}
+        {activeWorkspace && settings.toolsEnabled && modelToolSupport === 'unsupported' && (
+          <div className="agent-banner error">
+            <IconAlert size={14} />
+            <span>{toolSupportReason || 'این مدل فراخوانی ابزار را انجام نمی‌دهد.'} ابزارهای Workspace با آن غیرفعال‌اند — مدل دیگری انتخاب کنید.</span>
+            <button className="btn btn-ghost btn-xs" onClick={() => void probeModel(true)} disabled={probing}>
+              بررسی مجدد
+            </button>
+          </div>
+        )}
 
         {!active || active.messages.length === 0 ? <Welcome onPick={setInput} /> : (
           <div className="scroll-area" ref={scrollRef} onScroll={handleScroll}><div className="thread">

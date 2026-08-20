@@ -17,7 +17,22 @@ const KEYS = {
   activeProjectId: 'chatbot.activeProjectId',
   activeWorkspaceId: 'chatbot.activeWorkspaceId',
   layout: 'chatbot.layout',
+  toolSupport: 'chatbot.toolSupport',
 } as const
+
+/** One probe verdict, remembered per provider + base URL + model. */
+export interface ToolSupportRecord {
+  support: 'supported' | 'unsupported'
+  reason: string
+  at: number
+}
+
+export type ToolSupportMap = Record<string, ToolSupportRecord>
+
+/** Verdicts belong to a model *on a given endpoint*, never to a model name alone. */
+export function toolSupportKey(config: ApiConfig, model: string): string {
+  return `${config.provider}|${config.baseUrl.trim().replace(/\/+$/, '')}|${model}`
+}
 
 /** Widths of the two docked panels, in pixels. */
 export interface Layout {
@@ -118,6 +133,9 @@ export const storage = {
 
   loadActiveWorkspaceId: (): string | null => read<string | null>(KEYS.activeWorkspaceId, null),
   saveActiveWorkspaceId: (id: string | null): void => void write(KEYS.activeWorkspaceId, id),
+
+  loadToolSupport: (): ToolSupportMap => read<ToolSupportMap>(KEYS.toolSupport, {}),
+  saveToolSupport: (map: ToolSupportMap): void => void write(KEYS.toolSupport, map),
 
   loadLayout: (): Layout => ({ ...DEFAULT_LAYOUT, ...read<Partial<Layout>>(KEYS.layout, {}) }),
   saveLayout: (layout: Layout): void => void write(KEYS.layout, layout),

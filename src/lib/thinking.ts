@@ -23,6 +23,12 @@ export interface ThinkChunk {
    * `text` so far belongs to the reasoning panel. Consumers move it across.
    */
   reclassifyAsReasoning?: boolean
+  /**
+   * Everything streamed as `text` so far must be thrown away. The harness
+   * raises it when a round turns out to be a printed-out tool call rather than
+   * an answer, so the discarded text never reaches the transcript.
+   */
+  resetText?: boolean
 }
 
 /** Index of the earliest tag from `tags` in `s`, or -1. */

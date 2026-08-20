@@ -183,6 +183,11 @@ export interface ChatRequest {
   onDelta: (chunk: ThinkChunk) => void
   /** When present and non-empty, the model may answer with tool calls. */
   tools?: ToolSpec[]
+  /**
+   * `auto` lets the model decide; a name forces that one tool. Forcing is only
+   * used by the capability probe — a real turn always leaves the choice open.
+   */
+  toolChoice?: 'auto' | { name: string }
 }
 
 export interface ChatResult {
@@ -321,6 +326,10 @@ function buildBody(req: ChatRequest, provider: Provider) {
               description: t.description,
               input_schema: t.parameters,
             })),
+            tool_choice:
+              req.toolChoice && req.toolChoice !== 'auto'
+                ? { type: 'tool', name: req.toolChoice.name }
+                : { type: 'auto' },
           }
         : {}),
     }
@@ -340,7 +349,10 @@ function buildBody(req: ChatRequest, provider: Provider) {
             type: 'function',
             function: { name: t.name, description: t.description, parameters: t.parameters },
           })),
-          tool_choice: 'auto',
+          tool_choice:
+            req.toolChoice && req.toolChoice !== 'auto'
+              ? { type: 'function', function: { name: req.toolChoice.name } }
+              : 'auto',
         }
       : {}),
   }
@@ -577,4 +589,110 @@ export async function complete(
   })
 
   return text.trim()
+}
+
+/* -------------------------------------------------------------------------- */
+/*                           tool-calling capability                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Whether a provider/model pair really answers with structured tool calls.
+ * `unknown` means it was never probed — the harness still tries, it just can't
+ * promise the user anything.
+ */
+export type ToolSupport = 'unknown' | 'supported' | 'unsupported'
+
+export interface ToolProbeResult {
+  support: ToolSupport
+  /** Short Persian explanation, shown in the model picker. */
+  reason: string
+}
+
+/**
+ * A throwaway tool that touches nothing. The probe must never reach the
+ * workspace, so it asks for a fixed echo instead of a real capability.
+ */
+const PROBE_TOOL: ToolSpec = {
+  name: 'probe_ping',
+  description:
+    'A connectivity self-test. Call it exactly once with token "pong" and write no other text.',
+  parameters: {
+    type: 'object',
+    properties: { token: { type: 'string', description: 'Always the literal string pong.' } },
+    required: ['token'],
+  },
+}
+
+const PROBE_PROMPT =
+  'Run the connectivity self-test now by calling the probe_ping tool with token "pong". Do not answer in text.'
+
+/** One probe attempt; returns the tool calls the provider actually produced. */
+async function probeOnce(
+  config: ApiConfig,
+  model: string,
+  toolChoice: 'auto' | { name: string },
+  signal?: AbortSignal,
+): Promise<ToolCall[]> {
+  const { toolCalls } = await sendChat({
+    config,
+    model,
+    messages: [{ role: 'user', content: PROBE_PROMPT }],
+    systemPrompt: 'You are a tool-calling self-test. Reply only by calling the offered tool.',
+    temperature: 0,
+    maxTokens: 128,
+    stream: false,
+    signal: signal ?? new AbortController().signal,
+    onDelta: () => {},
+    tools: [PROBE_TOOL],
+    toolChoice,
+  })
+  return toolCalls
+}
+
+/**
+ * Proves — before the agent is trusted with the workspace — that this model
+ * emits real `tool_calls` / `tool_use` blocks rather than printing JSON into
+ * its answer. Forced choice is tried first because it is the cleanest signal;
+ * providers that reject a forced choice get a second chance on `auto`.
+ */
+export async function probeToolSupport(
+  config: ApiConfig,
+  model: string,
+  signal?: AbortSignal,
+): Promise<ToolProbeResult> {
+  if (!model.trim()) return { support: 'unknown', reason: 'مدلی انتخاب نشده است.' }
+
+  let forcedFailure: ApiError | null = null
+  try {
+    const calls = await probeOnce(config, model, { name: PROBE_TOOL.name }, signal)
+    if (calls.some((call) => call.name === PROBE_TOOL.name)) {
+      return { support: 'supported', reason: 'مدل فراخوانی ساختاریافته‌ی ابزار را برمی‌گرداند.' }
+    }
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
+    forcedFailure = error instanceof ApiError ? error : null
+    // A 4xx here usually means "I don't understand tool_choice", not "no tools".
+    if (!forcedFailure || (forcedFailure.status && forcedFailure.status >= 500)) throw error
+  }
+
+  try {
+    const calls = await probeOnce(config, model, 'auto', signal)
+    if (calls.some((call) => call.name === PROBE_TOOL.name)) {
+      return { support: 'supported', reason: 'مدل فراخوانی ساختاریافته‌ی ابزار را برمی‌گرداند.' }
+    }
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
+    return {
+      support: 'unsupported',
+      reason:
+        error instanceof ApiError && error.status
+          ? `سرویس درخواست دارای ابزار را با خطای ${error.status} رد کرد.`
+          : 'سرویس درخواست دارای ابزار را نپذیرفت.',
+    }
+  }
+
+  return {
+    support: 'unsupported',
+    reason: 'مدل به‌جای فراخوانی ساختاریافته، فقط متن برمی‌گرداند.',
+  }
 }
