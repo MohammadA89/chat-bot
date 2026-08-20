@@ -502,3 +502,76 @@ test('prose with no code block is not a shirked edit', () => {
   const text = 'این فایل مسئول ارسال پیام است و تغییری لازم ندارد.'
   assert.equal(pseudotool.detectUnappliedEdit(text, ['src/components/Composer.tsx']), null)
 })
+
+/* ------------------- announced but never actually called ------------------- */
+
+for (const { provider, stream } of MATRIX) {
+  const label = `${provider}/${stream ? 'streaming' : 'non-streaming'}`
+
+  test(`${label}: an announced-but-uncalled read is pushed into a real call`, async () => {
+    const bridge = fakeBridge()
+    const turn = await runTurn({
+      provider,
+      model: 'mock-announcer',
+      stream,
+      bridge,
+      text: 'میخوام فایل README رو کامل‌تر کنیم',
+    })
+
+    const read = turn.toolRuns.find((run) => run.name === 'workspace_read')
+    assert.ok(read, 'the announced read must actually happen')
+    assert.equal(read.ok, true)
+    assert.ok(
+      bridge.calls.some((call) => call.method === 'workspace.read'),
+      'the bridge must have been asked for the real file',
+    )
+    assert.ok(
+      !turn.answer.includes('نیاز داریم'),
+      'the discarded announcement must not survive in the answer',
+    )
+  })
+}
+
+test('a bare arguments object with no tool named is still a fake call', () => {
+  assert.equal(pseudotool.detectBareToolArgs('```json\n{ "path": "README.md" }\n```'), true)
+  assert.equal(
+    pseudotool.detectBareToolArgs('{ "command": "npm test", "cwd": "." }'),
+    false,
+    'cwd is not a tool argument name, so this is not a payload',
+  )
+})
+
+test('ordinary JSON in an answer is not a fake call', () => {
+  assert.equal(pseudotool.detectBareToolArgs('{ "name": "chat-bot", "version": "1.0.0" }'), false)
+  assert.equal(pseudotool.detectBareToolArgs('خروجی build چیزی برنگرداند.'), false)
+})
+
+test('announced inaction needs both an intent and a file', () => {
+  assert.equal(
+    pseudotool.detectAnnouncedInaction('برای شروع، فایل README.md را می‌خوانیم.'),
+    true,
+  )
+  assert.equal(pseudotool.detectAnnouncedInaction('برای شروع باید تصمیم بگیریم.'), false)
+  assert.equal(pseudotool.detectAnnouncedInaction('این پروژه از vite.config.ts استفاده می‌کند.'), false)
+})
+
+test('a long answer that did the work is never mistaken for an announcement', () => {
+  const long = 'باید فایل README.md را ببینیم. ' + 'توضیح مفصل. '.repeat(200)
+  assert.ok(long.length > 1500)
+  assert.equal(pseudotool.detectAnnouncedInaction(long), false)
+})
+
+test('an announcement after a tool already ran is left alone', async () => {
+  // `mock-workspace` reads first and then answers; that answer mentions the
+  // file and must not be second-guessed just because a path appears in it.
+  const bridge = fakeBridge()
+  const turn = await runTurn({
+    provider: 'openai',
+    model: 'mock-workspace',
+    stream: false,
+    bridge,
+    text: 'فایل README را بخوان',
+  })
+  assert.equal(turn.toolRuns.filter((run) => run.name === 'workspace_read').length, 1)
+  assert.equal(turn.toolCallingFailed, undefined)
+})

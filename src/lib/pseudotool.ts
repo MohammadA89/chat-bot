@@ -81,12 +81,58 @@ export const PSEUDO_TOOL_CORRECTION =
   'پاسخ قبلی‌ات یک فراخوانی ابزار به‌شکل متن یا JSON بود و بنابراین اجرا نشد و نادیده گرفته می‌شود. ' +
   'ابزارها فقط از طریق سازوکار رسمی tool call همین API اجرا می‌شوند. ' +
   'حالا همان ابزار را واقعاً صدا بزن و هیچ متنی ننویس. ' +
+  'اعلام کردن اینکه «فایل را می‌خوانیم» یا «این دستور لازم است» هیچ کاری انجام نمی‌دهد؛ فقط خودِ فراخوانی ابزار کار می‌کند. ' +
   'اگر واقعاً نمی‌توانی ابزار را فراخوانی کنی، در یک جمله همین را بگو و هیچ payload نمونه‌ای نساز.'
 
 /** Shown to the user when the model still refuses to make a real tool call. */
 export const PSEUDO_TOOL_FAILURE =
   'این مدل فراخوانی واقعی ابزار را انجام نمی‌دهد؛ به‌جای اجرای ابزار، متن یا JSON نمونه تولید کرد. ' +
   'هیچ فایلی خوانده یا تغییر داده نشد. یک مدل با پشتیبانی از function calling انتخاب کنید و دوباره تلاش کنید.'
+
+/**
+ * A JSON block that carries *only* tool arguments, with no tool named anywhere:
+ *
+ *     خواندن فایل README.md
+ *     ```json
+ *     { "path": "README.md" }
+ *     ```
+ *
+ * The tool name lives in the Persian prose around it, so name-anchored
+ * detection walks straight past. What gives it away is the object itself:
+ * every key is a tool parameter and there is nothing else in it.
+ */
+export function detectBareToolArgs(text: string): boolean {
+  if (!text.includes('{')) return false
+
+  for (const match of text.matchAll(/{[^{}]*}/g)) {
+    const keys = [...match[0].matchAll(/["']([A-Za-z_][A-Za-z0-9_]*)["']\s*:/g)].map((k) => k[1])
+    if (keys.length === 0 || keys.length > 5) continue
+    if (keys.every((key) => ARG_KEYS.includes(key))) return true
+  }
+  return false
+}
+
+/** Verbs a model uses when it commits to an action it is about to take. */
+const INTENT =
+  /(بخوان|می[‌ ]?خوان|میخوان|بخوانیم|ویرایش کن|اعمال کن|اجرا کن|اضافه کن|نیاز داریم|باید |ابتدا |برای شروع)/
+
+/** Anything that reads as a file this turn was supposed to open. */
+const FILE_TOKEN =
+  /[\w./-]+\.(?:ts|tsx|js|jsx|mjs|cjs|css|json|md|ya?ml|html|py|go|rs|java|sh|txt)\b/i
+
+/**
+ * The quietest version of the same failure: the model announces the tool call
+ * in prose — "برای شروع، فایل README.md را می‌خوانیم" — and then simply stops,
+ * having called nothing. It reads like a first step; it is the whole turn.
+ *
+ * Only considered when the turn ran no tool at all, and only for a short reply:
+ * a long answer that did the work does not need pushing.
+ */
+export function detectAnnouncedInaction(text: string): boolean {
+  const trimmed = text.trim()
+  if (!trimmed || trimmed.length > 1500) return false
+  return INTENT.test(trimmed) && FILE_TOKEN.test(trimmed)
+}
 
 /* -------------------------------------------------------------------------- */
 /*                       proposals that were never applied                     */

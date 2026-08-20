@@ -19,6 +19,7 @@ const MODELS = [
   { id: 'mock-editor', display_name: 'Mock Editor', owned_by: 'mock', created: 1719792000 },
   { id: 'mock-pseudo', display_name: 'Mock Pseudo Tools', owned_by: 'mock', created: 1719792000 },
   { id: 'mock-proposer', display_name: 'Mock Proposer', owned_by: 'mock', created: 1719792000 },
+  { id: 'mock-announcer', display_name: 'Mock Announcer', owned_by: 'mock', created: 1719792000 },
   { id: 'mock-stubborn', display_name: 'Mock Stubborn Proposer', owned_by: 'mock', created: 1719792000 },
   { id: 'mock-no-tools', display_name: 'Mock Without Tools', owned_by: 'mock', created: 1719792000 },
   { id: 'mock-rejects-tools', display_name: 'Mock Rejecting Tools', owned_by: 'mock', created: 1719792000 },
@@ -135,6 +136,18 @@ const PROPOSAL_REPLY = [
   '```',
 ].join('\n')
 
+const ANNOUNCE_REPLY = [
+  'برای ویرایش فایل Readme، باید اول فایل را بخوانیم و سپس تغییرات موردنظر را اعمال کنیم.',
+  'برای شروع، فایل README.md را می‌خوانیم.',
+  '',
+  '### خواندن فایل README.md',
+  'برای خواندن محتوا فعلی فایل README.md، به دستور زیر نیاز داریم:',
+  '',
+  '```json',
+  '{ "path": "README.md" }',
+  '```',
+].join('\n')
+
 const TOOL_ARGS = JSON.stringify({
   facts: ['کاربر رابط فارسی و راست‌به‌چپ می‌خواهد.', 'پروژه با React و Vite ساخته می‌شود.'],
 })
@@ -164,6 +177,8 @@ function offeredTools(body) {
  * - `mock-workspace` reads a file, then answers from the tool output.
  * - `mock-editor` reads, then edits.
  * - `mock-pseudo` prints a tool call as text and never makes a real one.
+ * - `mock-announcer` announces the call in prose and never makes it.
+ * - `mock-proposer` reads, then describes the edit; `mock-stubborn` keeps doing so.
  * - `mock-no-tools` ignores the tools it was offered.
  * - `mock-rejects-tools` refuses any request that carries tools (handled earlier).
  * - everything else keeps the original `remember` round-trip.
@@ -183,6 +198,18 @@ function planReply(body, model) {
       return { calls: [{ name: 'workspace_read', args: JSON.stringify({ path: 'README.md' }) }] }
     }
     return { text: `محتوای واقعی فایل: ${results[results.length - 1].slice(0, 160)}` }
+  }
+
+  // Announces the read it never performs — the reported failure, verbatim.
+  if (model === 'mock-announcer') {
+    const nudged = (body.messages ?? []).some((m) =>
+      typeof m.content === 'string' && m.content.includes('اعلام کردن اینکه'),
+    )
+    if (nudged) {
+      return { calls: [{ name: 'workspace_read', args: JSON.stringify({ path: 'README.md' }) }] }
+    }
+    if (results.length > 0) return { text: 'فایل README.md خوانده شد.' }
+    return { text: ANNOUNCE_REPLY }
   }
 
   // Reads the file, then describes the edit instead of making it. The

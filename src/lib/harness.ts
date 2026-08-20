@@ -16,6 +16,8 @@ import {
 } from './api'
 import { harnessTools, runTool, factLabel, type ToolEnv } from './tools'
 import {
+  detectAnnouncedInaction,
+  detectBareToolArgs,
   detectPseudoToolCall,
   detectUnappliedEdit,
   unappliedEditCorrection,
@@ -256,6 +258,7 @@ const TOOL_RULES = [
   '',
   '## قواعد قطعی',
   '- برای اجرای ابزار، خودِ ابزار را فراخوانی کن. هرگز نام ابزار، JSON ورودی یا payload نمونه را داخل متن پاسخ یا بلوک کد ننویس؛ چنین متنی اجرا نمی‌شود و فقط کاربر را گمراه می‌کند.',
+  '- کارت را اعلام نکن، انجام بده. جمله‌هایی مثل «اول فایل را می‌خوانیم» یا «برای این کار به این دستور نیاز داریم» بی‌فایده‌اند؛ در همان پاسخ ابزار را صدا بزن.',
   '- تا وقتی خروجی واقعی ابزار را ندیده‌ای، ادعا نکن فایلی را خوانده‌ای، تغییر داده‌ای یا دستوری را اجرا کرده‌ای.',
   '- اگر ابزار لازم در دسترس نیست یا فراخوانی آن شکست خورد، در یک جمله‌ی کوتاه همان مانع واقعی را بگو و کار انجام‌نشده را انجام‌شده جلوه نده.',
   '- ابزارها را بی‌دلیل صدا نزن؛ برای پاسخ به سؤال‌های عمومی نیازی به ابزار نیست.',
@@ -510,7 +513,15 @@ export async function runTurn(req: TurnRequest): Promise<TurnResult> {
       // The provider produced no structured call. If the text merely *looks*
       // like one, the answer is a fake: drop it, correct the model once, and
       // never parse the printed JSON — only a real call may reach a tool.
-      const pretended = tools ? detectPseudoToolCall(roundText, toolNames) : null
+      // Three shapes of the same lie, in falling order of confidence: the tool
+      // named beside its payload; a bare arguments object whose tool name only
+      // exists in the prose; and a turn that announces the call and stops. The
+      // last one is only trusted when nothing at all ran this turn.
+      const pretended = tools
+        ? (detectPseudoToolCall(roundText, toolNames) ??
+          (detectBareToolArgs(roundText) ? 'یک ابزار Workspace' : null) ??
+          (toolRuns.length === 0 && detectAnnouncedInaction(roundText) ? 'یک ابزار Workspace' : null))
+        : null
       if (!pretended) {
         // It called tools happily, read the file, then *described* the change
         // instead of making it. Push it once to finish the job for real.
