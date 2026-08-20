@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ModelInfo } from '../types'
+import type { ToolSupport } from '../lib/api'
 import { toFa } from '../lib/utils'
-import { IconCheck, IconChevronDown, IconRefresh, IconSearch, IconSparkles } from './Icons'
+import { IconAlert, IconCheck, IconChevronDown, IconRefresh, IconSearch, IconSparkles, IconWrench } from './Icons'
 
 interface ModelPickerProps {
   models: ModelInfo[]
@@ -9,9 +10,31 @@ interface ModelPickerProps {
   loading: boolean
   onChange: (id: string) => void
   onRefresh: () => void
+  /** Probe verdict for a model — `unknown` until it has been tested. */
+  supportOf?: (id: string) => ToolSupport
+  /** Why the active model got its verdict; shown under the search box. */
+  supportReason?: string
+  /** A capability probe is in flight. */
+  probing?: boolean
+  /** Re-runs the probe for the active model. */
+  onProbe?: () => void
 }
 
-export function ModelPicker({ models, value, loading, onChange, onRefresh }: ModelPickerProps) {
+/** The badge that tells the user whether a model can really run tools. */
+function SupportBadge({ support }: { support: ToolSupport }) {
+  if (support === 'unknown') return null
+  const ok = support === 'supported'
+  return (
+    <span className={`tool-badge${ok ? ' ok' : ' bad'}`} title={ok ? 'این مدل ابزارها را واقعاً اجرا می‌کند' : 'این مدل فراخوانی ابزار ندارد؛ Workspace با آن کار نمی‌کند'}>
+      {ok ? <IconWrench size={11} /> : <IconAlert size={11} />}
+      {ok ? 'ابزار' : 'بدون ابزار'}
+    </span>
+  )
+}
+
+export function ModelPicker({
+  models, value, loading, onChange, onRefresh, supportOf, supportReason, probing, onProbe,
+}: ModelPickerProps) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
   const ref = useRef<HTMLDivElement>(null)
@@ -39,6 +62,7 @@ export function ModelPicker({ models, value, loading, onChange, onRefresh }: Mod
   }, [models, query])
 
   const current = models.find((m) => m.id === value)
+  const currentSupport = supportOf?.(value) ?? 'unknown'
 
   return (
     <div className="model-picker" ref={ref}>
@@ -50,6 +74,7 @@ export function ModelPicker({ models, value, loading, onChange, onRefresh }: Mod
       >
         <IconSparkles size={15} />
         <span className="model-trigger-name">{current?.label ?? value ?? 'انتخاب مدل'}</span>
+        <SupportBadge support={currentSupport} />
         <IconChevronDown size={13} />
       </button>
 
@@ -80,6 +105,22 @@ export function ModelPicker({ models, value, loading, onChange, onRefresh }: Mod
                 autoFocus
               />
             </div>
+            {onProbe && (
+              <div className={`tool-support-row ${currentSupport}`}>
+                <span>
+                  {probing
+                    ? 'در حال بررسی سازگاری ابزار…'
+                    : currentSupport === 'supported'
+                      ? 'این مدل فراخوانی واقعی ابزار را انجام می‌دهد.'
+                      : currentSupport === 'unsupported'
+                        ? supportReason || 'این مدل فراخوانی ابزار را انجام نمی‌دهد؛ ابزارهای Workspace با آن کار نمی‌کنند.'
+                        : 'سازگاری ابزار این مدل هنوز بررسی نشده است.'}
+                </span>
+                <button className="btn btn-ghost btn-xs" onClick={onProbe} disabled={probing}>
+                  بررسی مجدد
+                </button>
+              </div>
+            )}
           </div>
 
           <div className="model-list">
@@ -97,7 +138,10 @@ export function ModelPicker({ models, value, loading, onChange, onRefresh }: Mod
                   }}
                 >
                   <div className="model-option-body">
-                    <div className="model-option-name">{m.label}</div>
+                    <div className="model-option-name">
+                      <span className="model-option-label">{m.label}</span>
+                      <SupportBadge support={supportOf?.(m.id) ?? 'unknown'} />
+                    </div>
                     <div className="model-option-id">{m.id}</div>
                   </div>
                   {m.id === value && <IconCheck className="check" size={15} />}

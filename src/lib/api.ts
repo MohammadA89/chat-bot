@@ -17,11 +17,17 @@ const ANTHROPIC_VERSION = '2023-06-01'
  * Normalises a user-supplied base URL into a versioned API root.
  * Accepts `https://x.com`, `https://x.com/`, `https://x.com/v1` — all become
  * `https://x.com/v1`. A base that already ends in a version segment is left as is.
+ *
+ * A value starting with `/` is kept as a same-origin path (`/api` → `/api/v1`).
+ * That is how the app is pointed at a reverse proxy — the dev server's, nginx,
+ * a hosted deployment's — which is the only way to reach an endpoint the
+ * browser refuses to call directly, and it belongs to no particular provider.
  */
 export function normalizeBaseUrl(raw: string): string {
   let base = raw.trim().replace(/\/+$/, '')
   if (!base) return ''
-  if (!/^https?:\/\//i.test(base)) base = `https://${base}`
+  const sameOrigin = base.startsWith('/')
+  if (!sameOrigin && !/^https?:\/\//i.test(base)) base = `https://${base}`
   if (!/\/v\d+[a-z]*$/i.test(base)) base = `${base}/v1`
   return base
 }
@@ -68,13 +74,32 @@ async function toApiError(res: Response): Promise<ApiError> {
   return new ApiError(detail ? `${head}\n${detail}` : head, res.status)
 }
 
-function networkError(err: unknown): ApiError {
+/**
+ * `localhost` is two addresses, and on Windows the browser tries the IPv6 one
+ * first. A local service bound only to IPv4 (`0.0.0.0` / `127.0.0.1`) is then
+ * unreachable through `localhost` while being perfectly healthy — and `curl`,
+ * which falls back to IPv4, reports it as fine. The failure looks like CORS and
+ * is not, so the hint has to name the real cause.
+ */
+function isLocalHostname(base: string): boolean {
+  try {
+    return new URL(base).hostname.toLowerCase() === 'localhost'
+  } catch {
+    return false
+  }
+}
+
+function networkError(err: unknown, base?: string): ApiError {
   if (err instanceof ApiError) return err
   if (err instanceof DOMException && err.name === 'AbortError') {
     return new ApiError('درخواست لغو شد.')
   }
+  const hint =
+    base && isLocalHostname(base)
+      ? '\nسرویس روی همین دستگاه است: به‌جای localhost آدرس 127.0.0.1 را امتحان کنید. در ویندوز localhost اول به ::1 (IPv6) ترجمه می‌شود و سرویسی که فقط روی IPv4 گوش می‌دهد از این راه دیده نمی‌شود.'
+      : ''
   return new ApiError(
-    'اتصال به سرور برقرار نشد. Base URL را بررسی کنید و مطمئن شوید سرویس اجازه‌ی دسترسی از مرورگر (CORS) را می‌دهد.',
+    `اتصال به سرور برقرار نشد. Base URL را بررسی کنید و مطمئن شوید سرویس اجازه‌ی دسترسی از مرورگر (CORS) را می‌دهد.${hint}`,
   )
 }
 
@@ -104,7 +129,7 @@ export async function listModels(config: ApiConfig, signal?: AbortSignal): Promi
       signal,
     })
   } catch (err) {
-    throw networkError(err)
+    throw networkError(err, base)
   }
   if (!res.ok) throw await toApiError(res)
 
@@ -183,6 +208,13 @@ export interface ChatRequest {
   onDelta: (chunk: ThinkChunk) => void
   /** When present and non-empty, the model may answer with tool calls. */
   tools?: ToolSpec[]
+  /**
+   * `auto` lets the model decide, `required` makes it call *some* tool, and a
+   * name forces that one. A normal round is always `auto`; the other two are
+   * for the capability probe and for pushing a model that answered in text
+   * where it was supposed to act.
+   */
+  toolChoice?: 'auto' | 'required' | { name: string }
 }
 
 export interface ChatResult {
@@ -302,6 +334,20 @@ function anthropicMessages(messages: WireMessage[]) {
   return out
 }
 
+/** `tool_choice` in OpenAI's spelling. */
+function openAiToolChoice(choice: ChatRequest['toolChoice']) {
+  if (!choice || choice === 'auto') return 'auto'
+  if (choice === 'required') return 'required'
+  return { type: 'function', function: { name: choice.name } }
+}
+
+/** The same three states in Anthropic's spelling. */
+function anthropicToolChoice(choice: ChatRequest['toolChoice']) {
+  if (!choice || choice === 'auto') return { type: 'auto' }
+  if (choice === 'required') return { type: 'any' }
+  return { type: 'tool', name: choice.name }
+}
+
 function buildBody(req: ChatRequest, provider: Provider) {
   const system = req.systemPrompt.trim()
   const tools = req.tools?.length ? req.tools : undefined
@@ -321,6 +367,7 @@ function buildBody(req: ChatRequest, provider: Provider) {
               description: t.description,
               input_schema: t.parameters,
             })),
+            tool_choice: anthropicToolChoice(req.toolChoice),
           }
         : {}),
     }
@@ -340,7 +387,7 @@ function buildBody(req: ChatRequest, provider: Provider) {
             type: 'function',
             function: { name: t.name, description: t.description, parameters: t.parameters },
           })),
-          tool_choice: 'auto',
+          tool_choice: openAiToolChoice(req.toolChoice),
         }
       : {}),
   }
@@ -432,7 +479,7 @@ export async function sendChat(req: ChatRequest): Promise<ChatResult> {
       signal,
     })
   } catch (err) {
-    throw networkError(err)
+    throw networkError(err, base)
   }
   if (!res.ok) throw await toApiError(res)
 
@@ -577,4 +624,147 @@ export async function complete(
   })
 
   return text.trim()
+}
+
+/**
+ * Proves the key is actually accepted for *generation*, not just for browsing
+ * the catalogue.
+ *
+ * Some gateways serve `GET /models` to anyone and only check the key when a
+ * completion is asked for. Listing models therefore says nothing, and the app
+ * would report a healthy connection that fails on the user's first message.
+ *
+ * Returns the blocking error, or `null` when the key is good. Only 401/403
+ * count: a 404 or a 429 is about that one model or that moment, not about
+ * whether the credentials work.
+ */
+export async function verifyChatAccess(
+  config: ApiConfig,
+  model: string,
+  signal?: AbortSignal,
+): Promise<ApiError | null> {
+  try {
+    await sendChat({
+      config,
+      model,
+      messages: [{ role: 'user', content: 'ping' }],
+      systemPrompt: '',
+      temperature: 0,
+      maxTokens: 1,
+      stream: false,
+      signal: signal ?? new AbortController().signal,
+      onDelta: () => {},
+    })
+    return null
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') return null
+    if (error instanceof ApiError && (error.status === 401 || error.status === 403)) return error
+    return null
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                           tool-calling capability                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Whether a provider/model pair really answers with structured tool calls.
+ * `unknown` means it was never probed — the harness still tries, it just can't
+ * promise the user anything.
+ */
+export type ToolSupport = 'unknown' | 'supported' | 'unsupported'
+
+export interface ToolProbeResult {
+  support: ToolSupport
+  /** Short Persian explanation, shown in the model picker. */
+  reason: string
+}
+
+/**
+ * A throwaway tool that touches nothing. The probe must never reach the
+ * workspace, so it asks for a fixed echo instead of a real capability.
+ */
+const PROBE_TOOL: ToolSpec = {
+  name: 'probe_ping',
+  description:
+    'A connectivity self-test. Call it exactly once with token "pong" and write no other text.',
+  parameters: {
+    type: 'object',
+    properties: { token: { type: 'string', description: 'Always the literal string pong.' } },
+    required: ['token'],
+  },
+}
+
+const PROBE_PROMPT =
+  'Run the connectivity self-test now by calling the probe_ping tool with token "pong". Do not answer in text.'
+
+/** One probe attempt; returns the tool calls the provider actually produced. */
+async function probeOnce(
+  config: ApiConfig,
+  model: string,
+  toolChoice: 'auto' | { name: string },
+  signal?: AbortSignal,
+): Promise<ToolCall[]> {
+  const { toolCalls } = await sendChat({
+    config,
+    model,
+    messages: [{ role: 'user', content: PROBE_PROMPT }],
+    systemPrompt: 'You are a tool-calling self-test. Reply only by calling the offered tool.',
+    temperature: 0,
+    maxTokens: 128,
+    stream: false,
+    signal: signal ?? new AbortController().signal,
+    onDelta: () => {},
+    tools: [PROBE_TOOL],
+    toolChoice,
+  })
+  return toolCalls
+}
+
+/**
+ * Proves — before the agent is trusted with the workspace — that this model
+ * emits real `tool_calls` / `tool_use` blocks rather than printing JSON into
+ * its answer. Forced choice is tried first because it is the cleanest signal;
+ * providers that reject a forced choice get a second chance on `auto`.
+ */
+export async function probeToolSupport(
+  config: ApiConfig,
+  model: string,
+  signal?: AbortSignal,
+): Promise<ToolProbeResult> {
+  if (!model.trim()) return { support: 'unknown', reason: 'مدلی انتخاب نشده است.' }
+
+  let forcedFailure: ApiError | null = null
+  try {
+    const calls = await probeOnce(config, model, { name: PROBE_TOOL.name }, signal)
+    if (calls.some((call) => call.name === PROBE_TOOL.name)) {
+      return { support: 'supported', reason: 'مدل فراخوانی ساختاریافته‌ی ابزار را برمی‌گرداند.' }
+    }
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
+    forcedFailure = error instanceof ApiError ? error : null
+    // A 4xx here usually means "I don't understand tool_choice", not "no tools".
+    if (!forcedFailure || (forcedFailure.status && forcedFailure.status >= 500)) throw error
+  }
+
+  try {
+    const calls = await probeOnce(config, model, 'auto', signal)
+    if (calls.some((call) => call.name === PROBE_TOOL.name)) {
+      return { support: 'supported', reason: 'مدل فراخوانی ساختاریافته‌ی ابزار را برمی‌گرداند.' }
+    }
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
+    return {
+      support: 'unsupported',
+      reason:
+        error instanceof ApiError && error.status
+          ? `سرویس درخواست دارای ابزار را با خطای ${error.status} رد کرد.`
+          : 'سرویس درخواست دارای ابزار را نپذیرفت.',
+    }
+  }
+
+  return {
+    support: 'unsupported',
+    reason: 'مدل به‌جای فراخوانی ساختاریافته، فقط متن برمی‌گرداند.',
+  }
 }

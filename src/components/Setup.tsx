@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from 'react'
 import type { ApiConfig, ModelInfo, Provider } from '../types'
-import { listModels } from '../lib/api'
+import { listModels, verifyChatAccess } from '../lib/api'
 import { IconAlert, IconEye, IconEyeOff, IconInfo, IconKey } from './Icons'
 import { toFa } from '../lib/utils'
 
@@ -15,6 +15,13 @@ const PROVIDERS: Array<{ id: Provider; name: string; endpoint: string }> = [
   { id: 'openai', name: 'OpenAI سازگار', endpoint: '/chat/completions' },
   { id: 'anthropic', name: 'Anthropic سازگار', endpoint: '/messages' },
 ]
+
+/**
+ * Set when this build was started with an API proxy configured. It is a plain
+ * path, so choosing it makes every request same-origin — the escape hatch for
+ * an endpoint the browser will not call directly, whoever is serving it.
+ */
+const proxyPath = import.meta.env.VITE_API_PROXY ? '/proxy-api' : ''
 
 export function Setup({ initial, onConnected, onCancel }: SetupProps) {
   const [provider, setProvider] = useState<Provider>(initial?.provider ?? 'openai')
@@ -35,6 +42,18 @@ export function Setup({ initial, onConnected, onCancel }: SetupProps) {
     setError('')
     try {
       const models = await listModels(config)
+
+      // Listing models is not proof of anything on gateways that leave the
+      // catalogue open, so the key is tried on a real one-token completion
+      // before the connection is called healthy.
+      const rejected = models[0] ? await verifyChatAccess(config, models[0].id) : null
+      if (rejected) {
+        setError(
+          `فهرست مدل‌ها خوانده شد، اما سرویس همین کلید را برای تولید پاسخ رد کرد:\n${rejected.message}`,
+        )
+        return
+      }
+
       onConnected(config, models)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'اتصال ناموفق بود.')
@@ -89,8 +108,18 @@ export function Setup({ initial, onConnected, onCancel }: SetupProps) {
               spellCheck={false}
             />
             <p className="field-hint">
-              اگر انتهای آدرس <code>/v1</code> نباشد، به‌صورت خودکار اضافه می‌شود.
+              اگر انتهای آدرس <code>/v1</code> نباشد، به‌صورت خودکار اضافه می‌شود. آدرسی که با{' '}
+              <code>/</code> شروع شود از همین origin خوانده می‌شود — برای وقتی که پشت یک reverse proxy هستید.
             </p>
+            {proxyPath && baseUrl.trim() !== proxyPath && (
+              <button
+                type="button"
+                className="btn btn-ghost btn-block btn-sm"
+                onClick={() => setBaseUrl(proxyPath)}
+              >
+                استفاده از proxy همین سرور ({proxyPath})
+              </button>
+            )}
           </div>
 
           <div className="field">

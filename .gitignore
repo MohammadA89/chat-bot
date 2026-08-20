@@ -8,3 +8,6 @@ dist-ssr
 *.log
 npm-debug.log*
 *.tsbuildinfo
+
+# local environment overrides
+.env.local

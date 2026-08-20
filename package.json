@@ -34,7 +34,8 @@
     "preview": "vite preview",
     "mock": "node scripts/mock-api.mjs",
     "bridge": "node scripts/local-bridge.mjs",
-    "bridge:self-test": "node scripts/local-bridge.mjs --self-test"
+    "bridge:self-test": "node scripts/local-bridge.mjs --self-test",
+    "test": "node --test scripts/agent-tests.mjs"
   },
   "dependencies": {
     "highlight.js": "^11.10.0",

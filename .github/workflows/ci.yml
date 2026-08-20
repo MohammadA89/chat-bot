@@ -24,3 +24,7 @@ jobs:
 
       - name: Bridge self-test
         run: npm run bridge:self-test
+
+      # Provider/tool-loop regression: real tool calls run, printed ones don't.
+      - name: Agent tests
+        run: npm test

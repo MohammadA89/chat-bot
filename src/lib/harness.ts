@@ -6,8 +6,26 @@
  * folding old turns into a summary, runs the tool-calling loop, and afterwards
  * distils durable facts out of the exchange back into project memory.
  */
-import { complete, sendChat, toWireMessages, type ToolCall, type WireMessage } from './api'
+import {
+  ApiError,
+  complete,
+  sendChat,
+  toWireMessages,
+  type ToolCall,
+  type ToolSupport,
+  type WireMessage,
+} from './api'
 import { harnessTools, runTool, factLabel, type ToolEnv } from './tools'
+import {
+  detectAnnouncedInaction,
+  detectBareToolArgs,
+  detectPseudoToolCall,
+  detectUnappliedEdit,
+  unappliedEditCorrection,
+  PSEUDO_TOOL_CORRECTION,
+  PSEUDO_TOOL_FAILURE,
+  WRITE_TOOLS,
+} from './pseudotool'
 import type {
   ApiConfig,
   ApprovalMode,
@@ -25,6 +43,18 @@ import { uid } from './utils'
 
 /** Hard stop for the tool loop, so a confused model can't spin forever. */
 export const MAX_TOOL_STEPS = 6
+
+/**
+ * How many times a printed-instead-of-called tool invocation is corrected
+ * before the turn gives up and tells the user the model can't do this.
+ */
+export const MAX_PSEUDO_RETRIES = 1
+
+/**
+ * How many times a model that described an edit instead of applying it is
+ * pushed to actually apply it before its answer is accepted as written.
+ */
+export const MAX_UNAPPLIED_RETRIES = 1
 
 /** Characters of a project file inlined into the prompt before it is trimmed. */
 const FILE_INLINE_LIMIT = 2400
@@ -105,8 +135,8 @@ function workspaceSection(
     lines.push(
       '',
       '## ساختار پوشه',
-      'نمای کوتاهی از ریشه‌ی پروژه است، نه فهرست کامل؛ پوشه‌های عمیق‌تر و فایل‌های بیشتری هم وجود دارند.',
-      'محتوای هیچ فایلی اینجا نیامده — برای دیدن کد حتماً workspace_read را صدا بزن.',
+      'این فقط یک نقشه‌ی ناوبری برای پیدا کردن مسیرهاست، نه فهرست کامل و نه محتوای فایل‌ها.',
+      'دیدن نام یک فایل در این نقشه به‌هیچ‌وجه یعنی خواندن آن نیست؛ برای هر ادعایی درباره‌ی محتوا اول workspace_read را اجرا کن.',
       tree,
     )
   }
@@ -116,12 +146,35 @@ function workspaceSection(
     '## روش کار',
     '- قبل از هر تغییر، وضعیت واقعی را ببین: با workspace_glob یا workspace_search محل کد را پیدا کن و با workspace_read فایل را کامل بخوان. هرگز روی حافظه یا حدس ویرایش نکن.',
     '- تغییرها را کوچک و هدفمند نگه دار: workspace_edit با متن دقیق، نه بازنویسی کامل فایل.',
+    '- oldText باید عیناً از خروجی همان workspace_read گرفته شود؛ نام بخش یا ساختار فایل را حدس نزن.',
     '- سبک، نام‌گذاری و ساختار فایل‌های موجود را تقلید کن؛ کتابخانه‌ای اضافه نکن مگر اینکه پروژه از قبل داشته باشد.',
     bridge.capabilities.shell
       ? '- بعد از تغییر کد، تست یا build مربوطه را با terminal_run اجرا کن و نتیجه‌ی واقعی را گزارش بده؛ اگر شکست خورد، خودت درستش کن.'
       : '- ترمینال در دسترس نیست، پس نگو تست را اجرا کردی؛ فقط دستور پیشنهادی را به کاربر بگو.',
     '- در پایان خلاصه‌ی کوتاهی از فایل‌های تغییرکرده بده و به مسیرشان اشاره کن.',
   )
+
+  if (bridge.capabilities.write && mode !== 'plan') {
+    lines.push(
+      '',
+      '## تغییر را انجام بده، پیشنهاد نده',
+      'وقتی کاربر تغییری می‌خواهد، خودت آن را با workspace_edit روی فایل واقعی اعمال کن.',
+      'بلوک «تغییرات پیشنهادی» یا «این کد را به آن کد تبدیل کنید» ننویس؛ کاربر ابزار را روشن کرده تا کار انجام شود، نه توصیف شود.',
+      mode === 'ask'
+        ? 'اگر تغییر بزرگ یا مبهم است باز هم آن را اجرا کن — پنجره‌ی تأیید با diff واقعی به کاربر نشان داده می‌شود و تصمیم با اوست.'
+        : 'فقط وقتی نیت کاربر مبهم است یک سؤال کوتاه بپرس؛ در بقیه‌ی موارد اعمال کن.',
+      'بعد از اعمال، فقط بگو چه چیزی در کدام فایل عوض شد.',
+    )
+  }
+
+  if (!bridge.capabilities.write) {
+    lines.push(
+      '',
+      '## نوشتن غیرفعال است',
+      'پل محلی بدون اجازه‌ی نوشتن اجرا شده، پس هیچ ابزار تغییر فایل در اختیار نداری.',
+      'اگر کاربر ویرایش خواست، در یک جمله بگو نوشتن در پل محلی خاموش است و تغییر پیشنهادی را به‌شکل diff یا قطعه‌کد نشان بده.',
+    )
+  }
 
   if (mode === 'plan') {
     lines.push(
@@ -185,7 +238,45 @@ export interface PromptContext {
   /** Shallow folder listing, so the model starts with a map instead of guesses. */
   workspaceTree?: string
   approvalMode?: ApprovalMode
+  /** What the capability probe learned about this model's tool calling. */
+  toolSupport?: ToolSupport
+  /**
+   * Why the workspace is out of reach this turn (bridge down, project folder
+   * not served, …). Stated plainly so the model reports the real obstacle
+   * instead of inventing a file it cannot open.
+   */
+  workspaceBlocked?: string
 }
+
+/**
+ * The non-negotiable part of the tool contract. It exists because a printed
+ * tool call is indistinguishable from real work to the user: the model must
+ * either invoke the tool through the API or say plainly that it cannot.
+ */
+const TOOL_RULES = [
+  '# ابزارها',
+  'ابزارها فقط از راه سازوکار رسمی tool call همین API اجرا می‌شوند و نتیجه‌شان به تو برمی‌گردد.',
+  '',
+  '## قواعد قطعی',
+  '- برای اجرای ابزار، خودِ ابزار را فراخوانی کن. هرگز نام ابزار، JSON ورودی یا payload نمونه را داخل متن پاسخ یا بلوک کد ننویس؛ چنین متنی اجرا نمی‌شود و فقط کاربر را گمراه می‌کند.',
+  '- کارت را اعلام نکن، انجام بده. جمله‌هایی مثل «اول فایل را می‌خوانیم» یا «برای این کار به این دستور نیاز داریم» بی‌فایده‌اند؛ در همان پاسخ ابزار را صدا بزن.',
+  '- تا وقتی خروجی واقعی ابزار را ندیده‌ای، ادعا نکن فایلی را خوانده‌ای، تغییر داده‌ای یا دستوری را اجرا کرده‌ای.',
+  '- اگر ابزار لازم در دسترس نیست یا فراخوانی آن شکست خورد، در یک جمله‌ی کوتاه همان مانع واقعی را بگو و کار انجام‌نشده را انجام‌شده جلوه نده.',
+  '- ابزارها را بی‌دلیل صدا نزن؛ برای پاسخ به سؤال‌های عمومی نیازی به ابزار نیست.',
+  '',
+  '## سبک پاسخ',
+  '- پاسخ نهایی نتیجه‌محور است: چه چیزی فهمیدی و چه چیزی تغییر کرد.',
+  '- روند داخلی، برنامه‌ی گام‌به‌گام، فهرست ابزارهای موجود، آموزش استفاده از ابزار و خلاصه‌ی تکراری ننویس. فعالیت ابزارها جای دیگری به کاربر نشان داده می‌شود.',
+  '- وقتی چیزی درباره‌ی پروژه می‌فهمی که در گفتگوهای بعدی هم مهم است، بدون درخواست کاربر آن را با remember ذخیره کن.',
+].join('\n')
+
+const TOOL_RULES_UNSUPPORTED = [
+  '# ابزارها',
+  'بررسی سازگاری نشان داد این مدل فراخوانی ساختاریافته‌ی ابزار را انجام نمی‌دهد، پس عملاً به فایل‌ها، ترمینال و GitHub دسترسی نداری.',
+  '- وانمود نکن ابزاری داری. JSON یا payload نمونه نساز.',
+  '- اگر کاربر کاری خواست که به ابزار نیاز دارد، در یک جمله بگو این مدل امکان اجرای ابزار ندارد و پیشنهاد بده مدل دیگری انتخاب کند.',
+  '- در بقیه‌ی موارد مثل یک دستیار معمولی و مفید پاسخ بده.',
+].join('\n')
 
 export function buildSystemPrompt(ctx: PromptContext): string {
   const today = new Date().toLocaleDateString('fa-IR', {
@@ -200,13 +291,20 @@ export function buildSystemPrompt(ctx: PromptContext): string {
   parts.push(`# محیط\nتاریخ امروز: ${today}\nمدل فعال: ${ctx.model}`)
 
   if (ctx.toolsEnabled) {
-    parts.push(
-      '# ابزارها\nابزارهایی در اختیار داری. وقتی چیزی درباره‌ی پروژه می‌فهمی که در گفتگوهای آینده هم مهم است، بدون اینکه کاربر بخواهد آن را با remember ذخیره کن. ابزارها را بی‌دلیل صدا نزن و نتیجه‌ی آن‌ها را در پاسخ نهایی به زبان طبیعی توضیح بده.',
-    )
+    parts.push(ctx.toolSupport === 'unsupported' ? TOOL_RULES_UNSUPPORTED : TOOL_RULES)
   }
 
-  if (ctx.bridge?.connected && ctx.workspace) {
+  if (ctx.bridge?.connected && ctx.workspace && ctx.toolSupport !== 'unsupported') {
     parts.push(workspaceSection(ctx.bridge, ctx.workspace, ctx.approvalMode ?? 'ask', ctx.workspaceTree))
+  } else if (ctx.workspaceBlocked) {
+    parts.push(
+      [
+        '# Workspace در دسترس نیست',
+        ctx.workspaceBlocked,
+        'پس هیچ ابزاری برای خواندن یا تغییر فایل‌های واقعی نداری.',
+        'اگر کاربر چنین کاری خواست، فقط همین مانع را در یک جمله بگو؛ محتوای فایل را حدس نزن و وانمود نکن کاری انجام شده است.',
+      ].join('\n'),
+    )
   }
 
   if (ctx.project) parts.push(projectSection(ctx.project))
@@ -304,12 +402,20 @@ export interface TurnRequest {
   onToolRun: (run: ToolRun) => void
   /** Fired when old turns were folded away, so the caller can persist it. */
   onSummary?: (summary: string, coveredCount: number) => void
+  /** What the capability probe already knows about this model. */
+  toolSupport?: ToolSupport
+  /** Fired when the turn itself proves the model can (or cannot) call tools. */
+  onToolSupport?: (support: ToolSupport, reason: string) => void
+  /** Why the real workspace is unreachable this turn, if it is. */
+  workspaceBlocked?: string
 }
 
 export interface TurnResult {
   usage?: Usage
   toolRuns: ToolRun[]
   steps: number
+  /** Set when the model printed tool calls instead of making them. */
+  toolCallingFailed?: boolean
 }
 
 function mergeUsage(a: Usage | undefined, b: Usage | undefined): Usage | undefined {
@@ -326,7 +432,10 @@ export async function runTurn(req: TurnRequest): Promise<TurnResult> {
   const { config, model, settings, project, history, signal, env } = req
 
   let summary = req.conversation.summary
-  const workspaceTree = await fetchWorkspaceTree(env)
+  // A model that cannot call tools gets no folder map either — the map would
+  // only invite it to narrate a project it can't actually open.
+  const workspaceTree =
+    req.toolSupport === 'unsupported' ? undefined : await fetchWorkspaceTree(env)
   const systemPrompt = () =>
     buildSystemPrompt({
       settings,
@@ -338,6 +447,8 @@ export async function runTurn(req: TurnRequest): Promise<TurnResult> {
       workspace: env.bridge?.workspace,
       workspaceTree,
       approvalMode: env.bridge?.mode,
+      toolSupport: req.toolSupport,
+      workspaceBlocked: req.workspaceBlocked,
     })
 
   // Reserve room for the assembled system prompt, then fill what is left.
@@ -355,35 +466,126 @@ export async function runTurn(req: TurnRequest): Promise<TurnResult> {
     }
   }
 
-  const tools = settings.toolsEnabled
-    ? harnessTools(Boolean(project), env.bridge?.status, env.bridge?.workspace)
-    : undefined
+  // Tools are only offered to a model that can actually call them; pretending
+  // otherwise is exactly the failure this guards against.
+  const tools =
+    settings.toolsEnabled && req.toolSupport !== 'unsupported'
+      ? harnessTools(Boolean(project), env.bridge?.status, env.bridge?.workspace)
+      : undefined
+  const toolNames = tools?.map((tool) => tool.name) ?? []
   const wire: WireMessage[] = [...plan.wire]
   const toolRuns: ToolRun[] = []
   let usage: Usage | undefined
   let steps = 0
+  let pseudoRetries = 0
+  /** Set by a correction so the next round must call a tool, not talk about it. */
+  let forceNextRound = false
+  let unappliedRetries = 0
+  let toolCallingFailed = false
+
+  /** Real files this turn opened — the only ones a shirked edit can be about. */
+  const touchedPaths = new Set<string>()
+  /** Whether a write tool has actually landed a change this turn. */
+  let wroteSomething = false
+  const canWrite =
+    toolNames.includes('workspace_edit') && env.bridge !== undefined && env.bridge.mode !== 'plan'
 
   for (; steps < MAX_TOOL_STEPS; steps++) {
     let roundText = ''
 
-    const result = await sendChat({
-      config,
-      model,
-      messages: wire,
-      systemPrompt: systemPrompt(),
-      temperature: settings.temperature,
-      maxTokens: settings.maxTokens,
-      stream: settings.streaming,
-      signal,
-      tools,
-      onDelta: (chunk) => {
-        if (chunk.text) roundText += chunk.text
-        req.onDelta(chunk)
-      },
-    })
+    const round = (toolChoice: 'auto' | 'required') => {
+      roundText = ''
+      return sendChat({
+        config,
+        model,
+        messages: wire,
+        systemPrompt: systemPrompt(),
+        temperature: settings.temperature,
+        maxTokens: settings.maxTokens,
+        stream: settings.streaming,
+        signal,
+        tools,
+        toolChoice,
+        onDelta: (chunk) => {
+          if (chunk.text) roundText += chunk.text
+          req.onDelta(chunk)
+        },
+      })
+    }
+
+    // A round that follows a correction stops asking and starts requiring: the
+    // model already answered in text where it was supposed to act, and words
+    // did not move it. Endpoints that reject a forced choice fall back to
+    // `auto`, so an unusual provider costs a retry rather than the whole turn.
+    let result
+    if (forceNextRound && tools) {
+      try {
+        result = await round('required')
+      } catch (error) {
+        if (error instanceof ApiError && error.status && error.status < 500) {
+          req.onDelta({ resetText: true })
+          result = await round('auto')
+        } else {
+          throw error
+        }
+      }
+    } else {
+      result = await round('auto')
+    }
+    forceNextRound = false
 
     usage = mergeUsage(usage, result.usage)
-    if (result.toolCalls.length === 0 || signal.aborted) break
+    if (signal.aborted) break
+
+    if (result.toolCalls.length === 0) {
+      // The provider produced no structured call. If the text merely *looks*
+      // like one, the answer is a fake: drop it, correct the model once, and
+      // never parse the printed JSON — only a real call may reach a tool.
+      // Three shapes of the same lie, in falling order of confidence: the tool
+      // named beside its payload; a bare arguments object whose tool name only
+      // exists in the prose; and a turn that announces the call and stops. The
+      // last one is only trusted when nothing at all ran this turn.
+      const pretended = tools
+        ? (detectPseudoToolCall(roundText, toolNames) ??
+          (detectBareToolArgs(roundText) ? 'یک ابزار Workspace' : null) ??
+          (toolRuns.length === 0 && detectAnnouncedInaction(roundText) ? 'یک ابزار Workspace' : null))
+        : null
+      if (!pretended) {
+        // It called tools happily, read the file, then *described* the change
+        // instead of making it. Push it once to finish the job for real.
+        const shirked =
+          canWrite && !wroteSomething
+            ? detectUnappliedEdit(roundText, [...touchedPaths])
+            : null
+        if (!shirked || unappliedRetries >= MAX_UNAPPLIED_RETRIES) break
+
+        unappliedRetries++
+        forceNextRound = true
+        req.onDelta({ resetText: true })
+        wire.push({ role: 'assistant', content: roundText })
+        wire.push({ role: 'user', content: unappliedEditCorrection(shirked) })
+        continue
+      }
+
+      req.onDelta({ resetText: true })
+      if (pseudoRetries >= MAX_PSEUDO_RETRIES) {
+        toolCallingFailed = true
+        req.onToolSupport?.('unsupported', 'مدل به‌جای فراخوانی ابزار، متن نمونه تولید کرد.')
+        req.onDelta({ text: PSEUDO_TOOL_FAILURE })
+        break
+      }
+
+      pseudoRetries++
+      forceNextRound = true
+      wire.push({ role: 'assistant', content: roundText })
+      wire.push({ role: 'user', content: PSEUDO_TOOL_CORRECTION })
+      continue
+    }
+
+    // A real, structured call came back — this model does support tools.
+    if (req.toolSupport !== 'supported') {
+      req.onToolSupport?.('supported', 'مدل فراخوانی ساختاریافته‌ی ابزار را برمی‌گرداند.')
+    }
 
     wire.push({ role: 'assistant', content: roundText, toolCalls: result.toolCalls })
 
@@ -391,6 +593,10 @@ export async function runTurn(req: TurnRequest): Promise<TurnResult> {
       const run = await execute(call, env)
       toolRuns.push(run)
       req.onToolRun(run)
+
+      if (run.ok && typeof run.input.path === 'string') touchedPaths.add(run.input.path)
+      if (run.ok && WRITE_TOOLS.includes(run.name)) wroteSomething = true
+
       wire.push({ role: 'tool', toolCallId: call.id, name: call.name, content: run.output })
     }
 
@@ -399,7 +605,7 @@ export async function runTurn(req: TurnRequest): Promise<TurnResult> {
     if (roundText.trim()) req.onDelta({ text: '\n\n' })
   }
 
-  return { usage, toolRuns, steps: steps + 1 }
+  return { usage, toolRuns, steps: steps + 1, toolCallingFailed: toolCallingFailed || undefined }
 }
 
 async function execute(call: ToolCall, env: ToolEnv): Promise<ToolRun> {

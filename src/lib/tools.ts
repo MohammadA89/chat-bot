@@ -457,6 +457,33 @@ function formatBridgeResult(result: unknown): string {
 }
 
 const DENIED = 'کاربر این عملیات را رد کرد. بدون انجام آن ادامه بده و در صورت نیاز راه دیگری پیشنهاد کن.'
+
+/**
+ * What each kind of mutation needs the sidecar to have been launched with, and
+ * what the model is told when it asks for one anyway. A model can name a tool
+ * it was never offered, so the permission the launch flags granted — not the
+ * advertised tool list — is what actually decides.
+ */
+const CAPABILITY_GATE: Record<
+  NonNullable<ApprovalRequest['kind']>,
+  { of: (capabilities: BridgeStatus['capabilities']) => boolean; message: string }
+> = {
+  write: {
+    of: (capabilities) => capabilities.write,
+    message:
+      'نوشتن در پل محلی خاموش است، پس هیچ فایلی تغییر نکرد. به کاربر بگو پل را با اجازه‌ی نوشتن اجرا کند و فعلاً فقط تغییر پیشنهادی را نشان بده.',
+  },
+  shell: {
+    of: (capabilities) => capabilities.shell,
+    message:
+      'اجرای ترمینال در پل محلی فعال نیست، پس هیچ دستوری اجرا نشد. فقط دستور پیشنهادی را به کاربر بگو.',
+  },
+  github: {
+    of: (capabilities) => capabilities.githubWrite,
+    message: 'نوشتن در GitHub فعال نیست، پس هیچ Issue، نظر یا PR ساخته نشد.',
+  },
+}
+
 const PLAN_ONLY =
   'حالت فعلی «فقط مطالعه» است، پس تغییر در Workspace انجام نمی‌شود. تغییر پیشنهادی‌ات را توضیح بده تا کاربر خودش حالت را عوض کند.'
 
@@ -480,6 +507,10 @@ async function bridgeTool(
   if (!bridge) return { ok: false, output: 'پل محلی Workspace متصل نیست.' }
 
   if (gate) {
+    const capability = CAPABILITY_GATE[gate.kind]
+    if (capability && !capability.of(bridge.status.capabilities)) {
+      return { ok: false, output: capability.message }
+    }
     if (bridge.mode === 'plan') return { ok: false, output: PLAN_ONLY }
     if (bridge.mode === 'ask') {
       let preview = gate.preview
