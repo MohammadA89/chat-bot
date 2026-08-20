@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from 'react'
 import type { ApiConfig, ModelInfo, Provider } from '../types'
-import { listModels } from '../lib/api'
+import { listModels, verifyChatAccess } from '../lib/api'
 import { IconAlert, IconEye, IconEyeOff, IconInfo, IconKey } from './Icons'
 import { toFa } from '../lib/utils'
 
@@ -35,6 +35,18 @@ export function Setup({ initial, onConnected, onCancel }: SetupProps) {
     setError('')
     try {
       const models = await listModels(config)
+
+      // Listing models is not proof of anything on gateways that leave the
+      // catalogue open, so the key is tried on a real one-token completion
+      // before the connection is called healthy.
+      const rejected = models[0] ? await verifyChatAccess(config, models[0].id) : null
+      if (rejected) {
+        setError(
+          `فهرست مدل‌ها خوانده شد، اما سرویس همین کلید را برای تولید پاسخ رد کرد:\n${rejected.message}`,
+        )
+        return
+      }
+
       onConnected(config, models)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'اتصال ناموفق بود.')

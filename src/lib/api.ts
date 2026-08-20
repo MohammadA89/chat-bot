@@ -601,6 +601,43 @@ export async function complete(
   return text.trim()
 }
 
+/**
+ * Proves the key is actually accepted for *generation*, not just for browsing
+ * the catalogue.
+ *
+ * Some gateways serve `GET /models` to anyone and only check the key when a
+ * completion is asked for. Listing models therefore says nothing, and the app
+ * would report a healthy connection that fails on the user's first message.
+ *
+ * Returns the blocking error, or `null` when the key is good. Only 401/403
+ * count: a 404 or a 429 is about that one model or that moment, not about
+ * whether the credentials work.
+ */
+export async function verifyChatAccess(
+  config: ApiConfig,
+  model: string,
+  signal?: AbortSignal,
+): Promise<ApiError | null> {
+  try {
+    await sendChat({
+      config,
+      model,
+      messages: [{ role: 'user', content: 'ping' }],
+      systemPrompt: '',
+      temperature: 0,
+      maxTokens: 1,
+      stream: false,
+      signal: signal ?? new AbortController().signal,
+      onDelta: () => {},
+    })
+    return null
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') return null
+    if (error instanceof ApiError && (error.status === 401 || error.status === 403)) return error
+    return null
+  }
+}
+
 /* -------------------------------------------------------------------------- */
 /*                           tool-calling capability                           */
 /* -------------------------------------------------------------------------- */

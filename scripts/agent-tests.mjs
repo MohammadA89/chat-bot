@@ -660,3 +660,23 @@ test('a model that ignores forcing too is reported, not pretended about', async 
   assert.equal(turn.toolCallingFailed, true)
   assert.equal(turn.toolRuns.length, 0)
 })
+
+/* ------------------------- connection verification ------------------------- */
+
+for (const provider of ['openai', 'anthropic']) {
+  test(`${provider}: a key that lists models but is rejected for chat fails the check`, async () => {
+    const open = { ...config(provider), apiKey: 'stale-key' }
+    const rejected = await api.verifyChatAccess(open, 'mock-pro')
+    assert.ok(rejected, 'an open catalogue must not pass as a working connection')
+    assert.equal(rejected.status, 401)
+  })
+
+  test(`${provider}: a working key passes the check`, async () => {
+    assert.equal(await api.verifyChatAccess(config(provider), 'mock-pro'), null)
+  })
+}
+
+test('a model-specific failure does not block the connection', async () => {
+  // 404 means "not that model", not "not your key" — connecting must still work.
+  assert.equal(await api.verifyChatAccess(config('openai'), 'no-such-model'), null)
+})

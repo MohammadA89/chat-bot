@@ -105,6 +105,18 @@ function streamFrames(res, frames) {
   res.on('close', () => clearInterval(timer))
 }
 
+/**
+ * Some gateways serve the model catalogue to anyone and only check the key
+ * when a completion is asked for, so listing models proves nothing. This key
+ * reproduces that: it passes `GET /models` and is refused everywhere else.
+ */
+const STALE_KEY = 'stale-key'
+
+function rejectsGeneration(req) {
+  const bearer = req.headers.authorization?.replace(/^Bearer /i, '')
+  return (bearer ?? req.headers['x-api-key']) === STALE_KEY
+}
+
 const sse = (data) => `data: ${JSON.stringify(data)}\n\n`
 const chunks = (text) => text.match(/[\s\S]{1,24}/g) ?? []
 
@@ -298,6 +310,11 @@ const handler = async (req, res) => {
 
   if (path === '/models' && req.method === 'GET') {
     return json(res, 200, { object: 'list', data: MODELS })
+  }
+
+
+  if (rejectsGeneration(req)) {
+    return json(res, 401, { error: { message: 'Invalid API key' } })
   }
 
   if (path === '/chat/completions' && req.method === 'POST') {
