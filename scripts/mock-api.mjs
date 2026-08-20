@@ -18,6 +18,8 @@ const MODELS = [
   { id: 'mock-workspace', display_name: 'Mock Workspace', owned_by: 'mock', created: 1719792000 },
   { id: 'mock-editor', display_name: 'Mock Editor', owned_by: 'mock', created: 1719792000 },
   { id: 'mock-pseudo', display_name: 'Mock Pseudo Tools', owned_by: 'mock', created: 1719792000 },
+  { id: 'mock-proposer', display_name: 'Mock Proposer', owned_by: 'mock', created: 1719792000 },
+  { id: 'mock-stubborn', display_name: 'Mock Stubborn Proposer', owned_by: 'mock', created: 1719792000 },
   { id: 'mock-no-tools', display_name: 'Mock Without Tools', owned_by: 'mock', created: 1719792000 },
   { id: 'mock-rejects-tools', display_name: 'Mock Rejecting Tools', owned_by: 'mock', created: 1719792000 },
 ]
@@ -116,6 +118,23 @@ const PSEUDO_REPLY = `برای خواندن فایل باید ابزار زیر 
 
 بعد از آن می‌توانیم با \`workspace_edit\` بخش نصب را کامل‌تر کنیم.`
 
+const PROPOSAL_REPLY = [
+  'برای این کار باید تغییرات زیر را در README.md اعمال کنید.',
+  '',
+  '### تغییرات پیشنهادی',
+  'تغییر این بخش از کد:',
+  '',
+  '```text',
+  'خط دوم',
+  '```',
+  '',
+  'به:',
+  '',
+  '```text',
+  'خط دوم به‌روزشده',
+  '```',
+].join('\n')
+
 const TOOL_ARGS = JSON.stringify({
   facts: ['کاربر رابط فارسی و راست‌به‌چپ می‌خواهد.', 'پروژه با React و Vite ساخته می‌شود.'],
 })
@@ -164,6 +183,28 @@ function planReply(body, model) {
       return { calls: [{ name: 'workspace_read', args: JSON.stringify({ path: 'README.md' }) }] }
     }
     return { text: `محتوای واقعی فایل: ${results[results.length - 1].slice(0, 160)}` }
+  }
+
+  // Reads the file, then describes the edit instead of making it. The
+  // stubborn one keeps doing so even after the harness pushes back.
+  if (model === 'mock-proposer' || model === 'mock-stubborn') {
+    if (results.length === 0) {
+      return { calls: [{ name: 'workspace_read', args: JSON.stringify({ path: 'README.md' }) }] }
+    }
+    // The harness's own correction, not the system prompt, is the signal here.
+    const nudged = (body.messages ?? []).some((m) =>
+      typeof m.content === 'string' && m.content.includes('به‌جای اعمال تغییر'),
+    )
+    if (nudged && model === 'mock-proposer') {
+      return {
+        calls: [{
+          name: 'workspace_edit',
+          args: JSON.stringify({ path: 'README.md', oldText: 'خط دوم', newText: 'خط دوم به‌روزشده' }),
+        }],
+      }
+    }
+    if (results.length > 1) return { text: 'فایل README.md به‌روزرسانی شد.' }
+    return { text: PROPOSAL_REPLY }
   }
 
   if (model === 'mock-editor') {

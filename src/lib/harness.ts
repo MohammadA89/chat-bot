@@ -15,7 +15,14 @@ import {
   type WireMessage,
 } from './api'
 import { harnessTools, runTool, factLabel, type ToolEnv } from './tools'
-import { detectPseudoToolCall, PSEUDO_TOOL_CORRECTION, PSEUDO_TOOL_FAILURE } from './pseudotool'
+import {
+  detectPseudoToolCall,
+  detectUnappliedEdit,
+  unappliedEditCorrection,
+  PSEUDO_TOOL_CORRECTION,
+  PSEUDO_TOOL_FAILURE,
+  WRITE_TOOLS,
+} from './pseudotool'
 import type {
   ApiConfig,
   ApprovalMode,
@@ -39,6 +46,12 @@ export const MAX_TOOL_STEPS = 6
  * before the turn gives up and tells the user the model can't do this.
  */
 export const MAX_PSEUDO_RETRIES = 1
+
+/**
+ * How many times a model that described an edit instead of applying it is
+ * pushed to actually apply it before its answer is accepted as written.
+ */
+export const MAX_UNAPPLIED_RETRIES = 1
 
 /** Characters of a project file inlined into the prompt before it is trimmed. */
 const FILE_INLINE_LIMIT = 2400
@@ -137,6 +150,19 @@ function workspaceSection(
       : '- ترمینال در دسترس نیست، پس نگو تست را اجرا کردی؛ فقط دستور پیشنهادی را به کاربر بگو.',
     '- در پایان خلاصه‌ی کوتاهی از فایل‌های تغییرکرده بده و به مسیرشان اشاره کن.',
   )
+
+  if (bridge.capabilities.write && mode !== 'plan') {
+    lines.push(
+      '',
+      '## تغییر را انجام بده، پیشنهاد نده',
+      'وقتی کاربر تغییری می‌خواهد، خودت آن را با workspace_edit روی فایل واقعی اعمال کن.',
+      'بلوک «تغییرات پیشنهادی» یا «این کد را به آن کد تبدیل کنید» ننویس؛ کاربر ابزار را روشن کرده تا کار انجام شود، نه توصیف شود.',
+      mode === 'ask'
+        ? 'اگر تغییر بزرگ یا مبهم است باز هم آن را اجرا کن — پنجره‌ی تأیید با diff واقعی به کاربر نشان داده می‌شود و تصمیم با اوست.'
+        : 'فقط وقتی نیت کاربر مبهم است یک سؤال کوتاه بپرس؛ در بقیه‌ی موارد اعمال کن.',
+      'بعد از اعمال، فقط بگو چه چیزی در کدام فایل عوض شد.',
+    )
+  }
 
   if (!bridge.capabilities.write) {
     lines.push(
@@ -448,7 +474,15 @@ export async function runTurn(req: TurnRequest): Promise<TurnResult> {
   let usage: Usage | undefined
   let steps = 0
   let pseudoRetries = 0
+  let unappliedRetries = 0
   let toolCallingFailed = false
+
+  /** Real files this turn opened — the only ones a shirked edit can be about. */
+  const touchedPaths = new Set<string>()
+  /** Whether a write tool has actually landed a change this turn. */
+  let wroteSomething = false
+  const canWrite =
+    toolNames.includes('workspace_edit') && env.bridge !== undefined && env.bridge.mode !== 'plan'
 
   for (; steps < MAX_TOOL_STEPS; steps++) {
     let roundText = ''
@@ -477,7 +511,21 @@ export async function runTurn(req: TurnRequest): Promise<TurnResult> {
       // like one, the answer is a fake: drop it, correct the model once, and
       // never parse the printed JSON — only a real call may reach a tool.
       const pretended = tools ? detectPseudoToolCall(roundText, toolNames) : null
-      if (!pretended) break
+      if (!pretended) {
+        // It called tools happily, read the file, then *described* the change
+        // instead of making it. Push it once to finish the job for real.
+        const shirked =
+          canWrite && !wroteSomething
+            ? detectUnappliedEdit(roundText, [...touchedPaths])
+            : null
+        if (!shirked || unappliedRetries >= MAX_UNAPPLIED_RETRIES) break
+
+        unappliedRetries++
+        req.onDelta({ resetText: true })
+        wire.push({ role: 'assistant', content: roundText })
+        wire.push({ role: 'user', content: unappliedEditCorrection(shirked) })
+        continue
+      }
 
       req.onDelta({ resetText: true })
       if (pseudoRetries >= MAX_PSEUDO_RETRIES) {
@@ -504,6 +552,10 @@ export async function runTurn(req: TurnRequest): Promise<TurnResult> {
       const run = await execute(call, env)
       toolRuns.push(run)
       req.onToolRun(run)
+
+      if (run.ok && typeof run.input.path === 'string') touchedPaths.add(run.input.path)
+      if (run.ok && WRITE_TOOLS.includes(run.name)) wroteSomething = true
+
       wire.push({ role: 'tool', toolCallId: call.id, name: call.name, content: run.output })
     }
 

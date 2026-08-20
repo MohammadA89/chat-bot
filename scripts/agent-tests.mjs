@@ -411,3 +411,94 @@ test('an incompatible model is not told it has workspace tools', () => {
   assert.ok(!prompt.includes('محیط برنامه‌نویسی واقعی'))
   assert.ok(prompt.includes('فراخوانی ساختاریافته‌ی ابزار را انجام نمی‌دهد'))
 })
+
+/* --------------------- edits described but never applied ------------------- */
+
+for (const { provider, stream } of MATRIX) {
+  const label = `${provider}/${stream ? 'streaming' : 'non-streaming'}`
+
+  test(`${label}: a described edit is pushed through to a real workspace_edit`, async () => {
+    const bridge = fakeBridge()
+    const turn = await runTurn({
+      provider,
+      model: 'mock-proposer',
+      stream,
+      bridge,
+      text: 'این بخش را به سمت چپ منتقل کن',
+    })
+
+    const edit = turn.toolRuns.find((run) => run.name === 'workspace_edit')
+    assert.ok(edit, 'the described edit must end up as a real call')
+    assert.equal(edit.ok, true)
+    assert.equal(bridge.files['README.md'].includes('خط دوم به‌روزشده'), true)
+    assert.ok(
+      !turn.answer.includes('تغییرات پیشنهادی'),
+      'the discarded proposal must not survive in the answer',
+    )
+  })
+}
+
+test('a model that keeps proposing is nudged only once', async () => {
+  const bridge = fakeBridge()
+  const turn = await runTurn({
+    provider: 'openai',
+    model: 'mock-stubborn',
+    stream: false,
+    bridge,
+    text: 'این بخش را به سمت چپ منتقل کن',
+  })
+
+  assert.equal(turn.toolRuns.filter((run) => run.name === 'workspace_edit').length, 0)
+  assert.equal(bridge.files['README.md'], README)
+  // One read, one nudged round, then its answer is accepted — no infinite loop.
+  assert.ok(turn.steps <= 4, `expected a bounded number of rounds, got ${turn.steps}`)
+})
+
+test('plan mode never nudges: proposing is exactly the job there', async () => {
+  const bridge = fakeBridge({ mode: 'plan' })
+  const turn = await runTurn({
+    provider: 'openai',
+    model: 'mock-stubborn',
+    stream: false,
+    bridge,
+    text: 'این بخش را به سمت چپ منتقل کن',
+  })
+
+  assert.ok(turn.answer.includes('تغییرات پیشنهادی'), 'the proposal is the answer in plan mode')
+  assert.equal(bridge.files['README.md'], README)
+})
+
+test('read-only bridges never nudge either', async () => {
+  const bridge = fakeBridge({
+    status: { ...STATUS, capabilities: { ...STATUS.capabilities, write: false } },
+  })
+  const turn = await runTurn({
+    provider: 'openai',
+    model: 'mock-stubborn',
+    stream: false,
+    bridge,
+    text: 'این بخش را به سمت چپ منتقل کن',
+  })
+
+  assert.ok(turn.answer.includes('تغییرات پیشنهادی'))
+  assert.equal(bridge.files['README.md'], README)
+})
+
+test('an answer that merely quotes an untouched file is left alone', () => {
+  const text = 'برای تغییر رنگ می‌توانی این کد را اضافه کنی:\n```css\n.a { color: red }\n```'
+  assert.equal(pseudotool.detectUnappliedEdit(text, []), null)
+  assert.equal(pseudotool.detectUnappliedEdit(text, ['src/other.ts']), null)
+})
+
+test('a proposal about a file this turn opened is caught', () => {
+  const text = 'تغییر این بخش از src/components/Composer.tsx:\n```tsx\n<div />\n```'
+  assert.equal(
+    pseudotool.detectUnappliedEdit(text, ['src/components/Composer.tsx']),
+    'src/components/Composer.tsx',
+  )
+})
+
+test('prose with no code block is not a shirked edit', () => {
+  const text = 'این فایل مسئول ارسال پیام است و تغییری لازم ندارد.'
+  assert.equal(pseudotool.detectUnappliedEdit(text, ['src/components/Composer.tsx']), null)
+})

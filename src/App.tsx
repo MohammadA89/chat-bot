@@ -116,6 +116,19 @@ export default function App() {
     if (bridgeStatus && !activeWorkspace) return 'هیچ Workspace فعالی انتخاب نشده است.'
     return 'کاربر هنوز پل محلی Workspace را وصل نکرده است.'
   }, [activeProject?.workspaceRoot, activeWorkspace, bridgeConfig, bridgeStatus, missingWorkspace])
+  /**
+   * What the assistant may actually do to this folder right now — the launch
+   * flags and the approval mode combined. It sits on the pill because "why
+   * can't it edit my file?" is otherwise invisible to the user.
+   */
+  const accessLevel = useMemo(() => {
+    if (!bridgeStatus?.capabilities.write) return { label: 'فقط خواندن', tone: 'muted' }
+    if (settings.approvalMode === 'plan') return { label: 'فقط مطالعه', tone: 'muted' }
+    return {
+      label: bridgeStatus.capabilities.shell ? 'ویرایش و ترمینال' : 'ویرایش',
+      tone: settings.approvalMode === 'auto' ? 'warn' : 'ok',
+    }
+  }, [bridgeStatus, settings.approvalMode])
 
   useEffect(() => {
     const timer = setTimeout(() => storage.saveConversations(conversations), 300)
@@ -602,6 +615,7 @@ export default function App() {
             <span className="status-dot" /><IconCode size={15} />
             <span>{missingWorkspace ? 'پوشه در دسترس نیست' : activeWorkspace?.name ?? 'اتصال Workspace'}</span>
             {activeWorkspace?.git.branch && <small><IconGitBranch size={11} />{activeWorkspace.git.branch}</small>}
+            {activeWorkspace && <small className={accessLevel.tone}>{accessLevel.label}</small>}
           </button>
           {/* Switching is a manual override, so it is hidden once a project pins the folder. */}
           {!activeProject?.workspaceRoot && (bridgeStatus?.workspaces.length ?? 0) > 1 && (
@@ -630,6 +644,30 @@ export default function App() {
           />
         </header>
 
+        {activeWorkspace && settings.toolsEnabled && modelToolSupport !== 'unsupported' &&
+          bridgeStatus && !bridgeStatus.capabilities.write && (
+          <div className="agent-banner">
+            <IconAlert size={14} />
+            <span>
+              پل محلی فقط با دسترسی خواندن اجرا شده، پس دستیار می‌تواند کد را بخواند اما هیچ فایلی را تغییر دهد.
+              برای ویرایش، پل را با <code>--allow-write</code> دوباره اجرا کنید.
+            </span>
+            <button className="btn btn-ghost btn-xs" onClick={() => setShowWorkspace(true)}>دستور اتصال</button>
+          </div>
+        )}
+        {activeWorkspace && settings.toolsEnabled && modelToolSupport !== 'unsupported' &&
+          bridgeStatus?.capabilities.write && settings.approvalMode === 'plan' && (
+          <div className="agent-banner">
+            <IconAlert size={14} />
+            <span>حالت «فقط مطالعه» فعال است، پس تغییرها اعمال نمی‌شوند و دستیار فقط پیشنهاد می‌دهد.</span>
+            <button
+              className="btn btn-ghost btn-xs"
+              onClick={() => setSettings((value) => ({ ...value, approvalMode: 'ask' }))}
+            >
+              فعال کردن ویرایش
+            </button>
+          </div>
+        )}
         {activeWorkspace && !settings.toolsEnabled && (
           <div className="agent-banner">
             <IconAlert size={14} />

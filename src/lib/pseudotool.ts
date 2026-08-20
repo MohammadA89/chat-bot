@@ -87,3 +87,55 @@ export const PSEUDO_TOOL_CORRECTION =
 export const PSEUDO_TOOL_FAILURE =
   'این مدل فراخوانی واقعی ابزار را انجام نمی‌دهد؛ به‌جای اجرای ابزار، متن یا JSON نمونه تولید کرد. ' +
   'هیچ فایلی خوانده یا تغییر داده نشد. یک مدل با پشتیبانی از function calling انتخاب کنید و دوباره تلاش کنید.'
+
+/* -------------------------------------------------------------------------- */
+/*                       proposals that were never applied                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The other half of the same failure: the model *can* call tools — it just read
+ * three files — and then answers with a "here are the changes to make" block
+ * instead of calling `workspace_edit`. The user sees a diff-looking answer and
+ * reasonably believes the file changed. Nothing did.
+ */
+const EDIT_INTENT =
+  /(تغییر|جایگزین|اضافه|اصلاح|ویرایش|به[\u200c ]?روزرسان|بروزرسان|پیشنهاد|replace|update|change|add)/i
+
+/** Tools whose success means a real file was actually touched. */
+export const WRITE_TOOLS = [
+  'workspace_create',
+  'workspace_write',
+  'workspace_edit',
+  'workspace_delete',
+  'workspace_rename',
+]
+
+/**
+ * Returns the path the answer proposes changing but never changed, or `null`.
+ *
+ * It only fires on files this very turn opened, so an answer that merely quotes
+ * some code cannot be mistaken for a shirked edit: the model looked at the real
+ * file, framed a change to it, and stopped short of making it.
+ */
+export function detectUnappliedEdit(text: string, touchedPaths: string[]): string | null {
+  if (!text.trim() || touchedPaths.length === 0) return null
+  if (!text.includes('```')) return null
+  if (!EDIT_INTENT.test(text)) return null
+
+  for (const path of touchedPaths) {
+    if (text.includes(path)) return path
+    const base = path.split(/[\\/]/).pop() ?? ''
+    if (base.length > 3 && text.includes(base)) return path
+  }
+  return null
+}
+
+/** The nudge handed to a model that described an edit instead of applying it. */
+export function unappliedEditCorrection(path: string): string {
+  return (
+    `تو ابزار ویرایش فایل واقعی را در اختیار داری و «${path}» را همین حالا خوانده‌ای، ` +
+    'اما به‌جای اعمال تغییر فقط آن را توصیف کردی؛ بنابراین هیچ فایلی عوض نشد و پاسخ قبلی‌ات نادیده گرفته می‌شود. ' +
+    'حالا تغییر را واقعاً با workspace_edit اعمال کن و oldText را عیناً از همان محتوایی بردار که خواندی. ' +
+    'اگر تغییر لازم نیست یا کاربر فقط توضیح خواسته، در یک جمله همین را بگو.'
+  )
+}
